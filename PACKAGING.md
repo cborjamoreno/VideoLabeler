@@ -20,6 +20,36 @@ that `PyQt6.QtMultimedia` imported correctly, and then runs `videolabeler.spec`.
 Requirements on the build machine: Python 3.9 or newer, and an internet
 connection for the first run. Nothing else — no compiler, no Qt install.
 
+### Running `build_windows.bat`
+
+**Unzip the project first.** Do not launch the script from inside the zip
+preview window — Windows runs it from a temporary folder and the build fails
+with confusing errors. Put the folder somewhere you can write to (Desktop,
+Documents), not `Program Files`.
+
+Then either:
+
+* **Double-click `build_windows.bat`** in File Explorer. If the file came by
+  email or download, Windows may block it: right-click → *Properties* → tick
+  *Unblock* → *OK*, then double-click again. If SmartScreen appears, *More
+  info* → *Run anyway*.
+* **Or from a terminal**, which is easier to read if something goes wrong:
+  open the project folder in File Explorer, type `cmd` in the address bar and
+  press Enter, then run `build_windows.bat`. In PowerShell it is
+  `.\build_windows.bat`.
+
+Administrator rights are not needed. The window stays open at the end (and on
+any error) so you can read the output.
+
+Install Python from [python.org](https://www.python.org/downloads/windows/) and
+**tick "Add python.exe to PATH"** on the first screen. The script prefers the
+`py` launcher precisely because plain `python` can hit the Microsoft Store
+placeholder, which does nothing and reports no error.
+
+Antivirus software often inspects — or quarantines — PyInstaller output. If the
+build is very slow or `dist\VideoLabeler.exe` disappears, add the project folder
+to your antivirus exclusions and build again.
+
 ## What to hand over
 
 Each build script ends by producing **one delivery zip** that is ready to

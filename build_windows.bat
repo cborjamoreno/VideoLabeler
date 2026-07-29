@@ -7,12 +7,39 @@ setlocal
 cd /d "%~dp0"
 
 echo.
-echo === Creating a clean build environment ===
-python -m venv build-env
+echo === Looking for Python ===
+REM Prefer the "py" launcher that the python.org installer provides: plain
+REM "python" may hit the Microsoft Store stub, which silently does nothing.
+set PYTHON=
+where py >nul 2>nul && set PYTHON=py -3
+if not defined PYTHON (
+    where python >nul 2>nul && set PYTHON=python
+)
+if not defined PYTHON (
+    echo.
+    echo ERROR: Python was not found.
+    echo        Install it from https://www.python.org/downloads/windows/
+    echo        and TICK "Add python.exe to PATH" on the first setup screen.
+    pause
+    exit /b 1
+)
+
+%PYTHON% --version
 if errorlevel 1 (
     echo.
-    echo ERROR: Python was not found. Install it from python.org and tick
-    echo        "Add python.exe to PATH" during setup.
+    echo ERROR: Python is registered but does not run. This usually means the
+    echo        Microsoft Store placeholder is in the way. Install real Python
+    echo        from python.org, or turn off the "App execution aliases" for
+    echo        python.exe in Windows Settings.
+    pause
+    exit /b 1
+)
+
+echo.
+echo === Creating a clean build environment ===
+%PYTHON% -m venv build-env
+if errorlevel 1 (
+    echo ERROR: could not create the build environment.
     pause
     exit /b 1
 )
@@ -31,11 +58,13 @@ if errorlevel 1 (
 
 echo.
 echo === Checking that audio support is present ===
-python -c "from PyQt6.QtMultimedia import QMediaPlayer; print('audio OK')"
+python -c "from PyQt6.QtMultimedia import QMediaPlayer; print('audio OK')" 2>nul || echo WARNING: QtMultimedia is missing. The app will build, but with no sound.
 
 echo.
 echo === Building ===
-rmdir /s /q build dist 2>nul
+REM One directory per command: "rmdir a b" is not valid.
+rmdir /s /q build 2>nul
+rmdir /s /q dist 2>nul
 pyinstaller videolabeler.spec --noconfirm
 if errorlevel 1 (
     echo ERROR: the build failed.
