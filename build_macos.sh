@@ -33,14 +33,25 @@ echo "=== Ad-hoc signing ==="
 codesign --force --deep --sign - dist/VideoLabeler.app
 codesign --verify --verbose dist/VideoLabeler.app || true
 
-# Zip with ditto: it preserves the bundle structure and symlinks, which a
-# plain `zip` mangles.
+# Pack what the end users receive: the app plus their instructions, and
+# nothing else — no source, no build scripts.
+#
+# ditto, not zip: a .app is a folder, and a plain `zip` mangles its symlinks
+# and extended attributes, leaving an app that will not open.
 echo
 echo "=== Packing for delivery ==="
-ditto -c -k --sequesterRsrc --keepParent dist/VideoLabeler.app VideoLabeler-macos.zip
+DELIVERY="dist/VideoLabeler-macos"
+rm -rf "$DELIVERY" VideoLabeler-macos.zip
+mkdir -p "$DELIVERY"
+ditto dist/VideoLabeler.app "$DELIVERY/VideoLabeler.app"
+[ -f LEEME_USUARIOS.txt ] && cp LEEME_USUARIOS.txt "$DELIVERY/"
+ditto -c -k --sequesterRsrc --keepParent "$DELIVERY" VideoLabeler-macos.zip
 
 echo
 echo "=== Done ==="
-echo "App:  $(pwd)/dist/VideoLabeler.app"
-echo "Zip:  $(pwd)/VideoLabeler-macos.zip"
-echo "Annotations will be saved to an \"annotations\" folder next to the app."
+echo "Send this file to the annotators, and nothing else:"
+echo "    $(pwd)/VideoLabeler-macos.zip"
+echo
+echo "It contains the app and a short usage guide (in Spanish). Tell them to"
+echo "unzip it, keep the app somewhere writable (Desktop, not /Applications),"
+echo "and open it the FIRST time with right-click -> Open."

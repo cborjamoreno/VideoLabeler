@@ -7,11 +7,11 @@ cross-compile: a Windows `.exe` can only be produced on Windows, and a macOS
 `.app` only on macOS. There is no way around this from Linux. If you have no
 Mac at hand, see *Building without the machine* at the end.
 
-| Target | Build on | Command | Result |
+| Target | Build on | Command | Zip to hand over |
 |---|---|---|---|
-| Windows | Windows 10/11 | double-click `build_windows.bat` | `dist\VideoLabeler.exe` |
-| macOS | macOS 11+ | `bash build_macos.sh` | `dist/VideoLabeler.app` + `VideoLabeler-macos.zip` |
-| Linux | Linux | `pyinstaller videolabeler.spec` | `dist/VideoLabeler` |
+| Windows | Windows 10/11 | double-click `build_windows.bat` | `VideoLabeler-windows.zip` |
+| macOS | macOS 11+ | `bash build_macos.sh` | `VideoLabeler-macos.zip` |
+| Linux | Linux | `pyinstaller videolabeler.spec` | `dist/VideoLabeler` (no zip step) |
 
 Each script creates its own `build-env` virtual environment, installs the
 dependencies **with pip** (which is what brings the audio support), verifies
@@ -22,17 +22,32 @@ connection for the first run. Nothing else — no compiler, no Qt install.
 
 ## What to hand over
 
-* **Windows** — just `VideoLabeler.exe`. It is one self-contained file
-  (~160 MB, normal for Qt + OpenCV). It takes a few seconds to start the first
-  time because it unpacks itself into a temporary folder.
-* **macOS** — `VideoLabeler-macos.zip`, produced by the build script with
-  `ditto`. Do **not** re-zip the `.app` with a plain `zip`, and do not send it
-  through anything that strips extended attributes; the bundle stops working.
+Each build script ends by producing **one delivery zip** that is ready to
+forward as-is. Send that, and nothing else — the annotators never need the
+source, the build scripts or Python.
+
+```
+VideoLabeler-macos.zip              VideoLabeler-windows.zip
+└── VideoLabeler-macos/             └── VideoLabeler-windows/
+    ├── VideoLabeler.app                ├── VideoLabeler.exe
+    └── LEEME_USUARIOS.txt              └── LEEME_USUARIOS.txt
+```
+
+The annotator unzips it and opens the app or the `.exe` directly. `.app` looks
+like a single icon in Finder even though it is a folder underneath.
 
 Both write their CSVs to an `annotations` folder **next to the executable**
 (next to the `.app` on macOS), exactly like running from source. Tell users to
 put the executable somewhere writable — their Desktop or a data folder, not
 `Program Files` or `/Applications`.
+
+On macOS the zip is built with `ditto`. Do **not** re-zip the `.app` with a
+plain `zip`, and do not send it through anything that strips extended
+attributes; the bundle stops working. On Windows the `.exe` is a single
+ordinary file, so any zip tool is fine.
+
+Each build is ~150-160 MB — normal for Qt + OpenCV, and too big for email.
+Use Drive, WeTransfer or similar.
 
 ## First launch on someone else's machine
 

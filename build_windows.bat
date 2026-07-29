@@ -44,7 +44,21 @@ if errorlevel 1 (
 )
 
 echo.
+echo === Packing for delivery ===
+REM What the annotators receive: the .exe plus their instructions, nothing else.
+rmdir /s /q "dist\VideoLabeler-windows" 2>nul
+del /q VideoLabeler-windows.zip 2>nul
+mkdir "dist\VideoLabeler-windows"
+copy /y "dist\VideoLabeler.exe" "dist\VideoLabeler-windows\" >nul
+if exist LEEME_USUARIOS.txt copy /y LEEME_USUARIOS.txt "dist\VideoLabeler-windows\" >nul
+powershell -NoProfile -Command "Compress-Archive -Path 'dist\VideoLabeler-windows' -DestinationPath 'VideoLabeler-windows.zip' -Force"
+
+echo.
 echo === Done ===
-echo Your executable: %cd%\dist\VideoLabeler.exe
-echo Annotations will be saved to an "annotations" folder next to it.
+echo Send this file to the annotators, and nothing else:
+echo     %cd%\VideoLabeler-windows.zip
+echo.
+echo It contains the .exe and a short usage guide (in Spanish). Tell them to
+echo unzip it, keep the .exe somewhere writable (Desktop, not Program Files),
+echo and click "More info" -^> "Run anyway" the first time SmartScreen warns.
 pause
