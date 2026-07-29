@@ -27,10 +27,10 @@ forward as-is. Send that, and nothing else — the annotators never need the
 source, the build scripts or Python.
 
 ```
-VideoLabeler-macos.zip              VideoLabeler-windows.zip
-└── VideoLabeler-macos/             └── VideoLabeler-windows/
-    ├── VideoLabeler.app                ├── VideoLabeler.exe
-    └── LEEME_USUARIOS.txt              └── LEEME_USUARIOS.txt
+VideoLabeler-macos.zip            VideoLabeler-windows.zip
+└── VideoLabeler-macos/           └── VideoLabeler-windows/
+    ├── VideoLabeler.app              ├── VideoLabeler.exe
+    └── README_USERS.txt              └── README_USERS.txt
 ```
 
 The annotator unzips it and opens the app or the `.exe` directly. `.app` looks

@@ -44,7 +44,7 @@ DELIVERY="dist/VideoLabeler-macos"
 rm -rf "$DELIVERY" VideoLabeler-macos.zip
 mkdir -p "$DELIVERY"
 ditto dist/VideoLabeler.app "$DELIVERY/VideoLabeler.app"
-[ -f LEEME_USUARIOS.txt ] && cp LEEME_USUARIOS.txt "$DELIVERY/"
+[ -f README_USERS.txt ] && cp README_USERS.txt "$DELIVERY/"
 ditto -c -k --sequesterRsrc --keepParent "$DELIVERY" VideoLabeler-macos.zip
 
 echo
@@ -52,6 +52,6 @@ echo "=== Done ==="
 echo "Send this file to the annotators, and nothing else:"
 echo "    $(pwd)/VideoLabeler-macos.zip"
 echo
-echo "It contains the app and a short usage guide (in Spanish). Tell them to"
+echo "It contains the app and a short usage guide. Tell them to"
 echo "unzip it, keep the app somewhere writable (Desktop, not /Applications),"
 echo "and open it the FIRST time with right-click -> Open."
