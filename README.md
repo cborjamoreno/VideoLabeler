@@ -1,4 +1,4 @@
-# Video Annotator — first apparition of each animal
+# Video Annotator — point and bounding box annotations
 
 A small, portable GUI to watch a video, pause it, and mark animals on the paused
 frame with a **point** or a **bounding box**. Each mark gets a class name, and
