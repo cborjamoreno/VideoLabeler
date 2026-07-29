@@ -1,0 +1,12 @@
+# Video Annotator dependencies — the whole list.
+# No torch, no CUDA, no model weights: this app is pure GUI + video decoding.
+#
+# Pinning rationale: lower bounds only. Anything tighter ages badly across
+# Python / OS variants.
+
+PyQt6>=6.5
+# headless = the OpenCV build without its own GUI/Qt bits. The app draws
+# everything through PyQt6, and the regular opencv-python ships a second copy
+# of Qt that clashes with PyQt6's when packaging with PyInstaller.
+opencv-python-headless>=4.8.0
+numpy>=1.24,<3

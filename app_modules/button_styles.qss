@@ -1,0 +1,120 @@
+/* Common button styles */
+QPushButton {
+    border-radius: 4px;
+    padding: 5px;
+    font-family: Arial, sans-serif;  /* Use a font that supports emoji */
+}
+
+/* Neutral button (Open video, Cancel, ...) */
+QPushButton.neutral-button {
+    background-color: white;
+    color: black;
+    border: 1px solid #ccc;
+}
+QPushButton.neutral-button:hover {
+    background-color: #f0f0f0;
+}
+QPushButton.neutral-button:disabled {
+    background-color: #EEEEEE;
+    color: #9E9E9E;
+}
+
+/* Primary button (OK, Play/Pause) */
+QPushButton.primary-button {
+    background-color: #2196F3;
+    color: white;
+    border: none;
+}
+QPushButton.primary-button:hover {
+    background-color: #1976D2;
+}
+QPushButton.primary-button:disabled {
+    background-color: #BDBDBD;
+}
+
+/* Frame-step buttons */
+QPushButton.step-button {
+    background-color: #FF9800;
+    color: white;
+    border: none;
+    border-radius: 4px;
+    font-size: 16px;
+}
+QPushButton.step-button:hover {
+    background-color: #F57C00;
+}
+QPushButton.step-button:disabled {
+    background-color: #BDBDBD;
+}
+
+/* Point tool - idle / armed */
+QPushButton.point-button-idle {
+    background-color: #4CAF50;
+    color: white;
+    border: 1px solid #2E7D32;
+}
+QPushButton.point-button-idle:hover {
+    background-color: #43A047;
+}
+QPushButton.point-button-idle:disabled {
+    background-color: #BDBDBD;
+    border: 1px solid #9E9E9E;
+}
+QPushButton.point-button-active {
+    background-color: #00E676;
+    color: black;
+    border: 3px solid #1B5E20;
+    font-weight: bold;
+}
+QPushButton.point-button-active:hover {
+    background-color: #00C853;
+}
+
+/* BBox tool - idle / armed */
+QPushButton.bbox-button-idle {
+    background-color: #009688;
+    color: white;
+    border: 1px solid #00695C;
+}
+QPushButton.bbox-button-idle:hover {
+    background-color: #00796B;
+}
+QPushButton.bbox-button-idle:disabled {
+    background-color: #BDBDBD;
+    border: 1px solid #9E9E9E;
+}
+QPushButton.bbox-button-active {
+    background-color: #00BFA5;
+    color: black;
+    border: 3px solid #004D40;
+    font-weight: bold;
+}
+QPushButton.bbox-button-active:hover {
+    background-color: #00897B;
+}
+
+/* Save button */
+QPushButton.save-button {
+    background-color: #006400;
+    color: white;
+    border: none;
+}
+QPushButton.save-button:hover {
+    background-color: #004d00;
+}
+QPushButton.save-button:disabled {
+    background-color: #BDBDBD;
+}
+
+/* Delete button */
+QPushButton.delete-button {
+    background-color: #E60000;
+    color: white;
+    border: none;
+}
+QPushButton.delete-button:hover {
+    background-color: #CC0000;
+}
+QPushButton.delete-button:disabled {
+    background-color: #BDBDBD;
+}
