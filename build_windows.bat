@@ -27,10 +27,21 @@ if not defined PYTHON (
 %PYTHON% --version
 if errorlevel 1 (
     echo.
-    echo ERROR: Python is registered but does not run. This usually means the
-    echo        Microsoft Store placeholder is in the way. Install real Python
-    echo        from python.org, or turn off the "App execution aliases" for
-    echo        python.exe in Windows Settings.
+    echo ERROR: Python is NOT installed. What you have are Microsoft's
+    echo        placeholder shortcuts, which only offer to open the Store.
+    echo.
+    echo        FIX:
+    echo         1. Download Python from
+    echo            https://www.python.org/downloads/windows/
+    echo            ^("Windows installer ^(64-bit^)"^)
+    echo         2. Run it and TICK "Add python.exe to PATH" on the FIRST
+    echo            screen, then click "Install Now".
+    echo         3. CLOSE this window and any open terminal, then run this
+    echo            script again ^(the PATH only refreshes in new windows^).
+    echo.
+    echo        If it still fails afterwards, turn off the placeholders:
+    echo        Settings ^> Apps ^> Advanced app settings ^> App execution
+    echo        aliases ^> switch OFF python.exe and python3.exe.
     pause
     exit /b 1
 )

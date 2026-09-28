@@ -5,6 +5,27 @@ QPushButton {
     font-family: Arial, sans-serif;  /* Use a font that supports emoji */
 }
 
+/* Message-box buttons (Save / Load dialogs, Yes / No, ...). They have no class
+   of their own, and the rule above drops the native look, so without this they
+   render as plain text. Scoped to QMessageBox so the toolbar buttons, which have
+   fixed widths, are untouched. */
+QMessageBox QPushButton {
+    background-color: #F5F5F5;
+    color: black;
+    border: 1px solid #9E9E9E;
+    padding: 6px 14px;
+}
+QMessageBox QPushButton:hover {
+    background-color: #E3F2FD;
+    border: 1px solid #2196F3;
+}
+QMessageBox QPushButton:pressed {
+    background-color: #BBDEFB;
+}
+QMessageBox QPushButton:default {
+    border: 2px solid #2196F3;
+}
+
 /* Neutral button (Open video, Cancel, ...) */
 QPushButton.neutral-button {
     background-color: white;
@@ -117,4 +138,27 @@ QPushButton.delete-button:hover {
 }
 QPushButton.delete-button:disabled {
     background-color: #BDBDBD;
+}
+
+/* Action tool - idle / armed */
+QPushButton.action-button-idle {
+    background-color: #7B1FA2;
+    color: white;
+    border: 1px solid #4A148C;
+}
+QPushButton.action-button-idle:hover {
+    background-color: #6A1B9A;
+}
+QPushButton.action-button-idle:disabled {
+    background-color: #BDBDBD;
+    border: 1px solid #9E9E9E;
+}
+QPushButton.action-button-active {
+    background-color: #E040FB;
+    color: black;
+    border: 3px solid #4A148C;
+    font-weight: bold;
+}
+QPushButton.action-button-active:hover {
+    background-color: #D500F9;
 }

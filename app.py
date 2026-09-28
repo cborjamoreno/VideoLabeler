@@ -1,10 +1,32 @@
-"""Video annotation tool — mark the first apparition of each animal.
+"""Video annotation tool — apparitions and actions of animals in a video.
 
-Play a video, pause it, and drop a point or a bounding box on the paused frame.
-Every annotation carries a class name and is exported to CSV:
+Two kinds of annotation, both drawn as boxes on a paused frame:
 
-    <video>_points.csv  video_name,frame,time_sec,class_name,x,y
-    <video>_bboxes.csv  video_name,frame,time_sec,class_name,x,y,width,height
+* Apparition — one box on one frame, with the species (class) seen.
+* Action — an interval of one of a fixed set of types (Interaction, Passing,
+  Shelter use, Foraging, Presence, Approach, Consume), performed by one
+  individual (two or more for an interaction, possibly of the same species, and
+  able to join or leave while it lasts). It has a box on its first frame and
+  another on its last frame, since the animals may have moved in between.
+
+Everything is exported to CSV:
+
+    <video>_bboxes.csv   video_name,frame,time_sec,class_name,x,y,width,height
+    <video>_actions.csv  action_id,video_name,action,classes,individuals,
+                         start_frame,start_time_sec,end_frame,end_time_sec,
+                         duration_sec,start_x,start_y,start_width,start_height,
+                         end_x,end_y,end_width,end_height
+    <video>_participants.csv
+                         action_id,video_name,action,individual,class_name,
+                         join_frame,join_time_sec,leave_frame,leave_time_sec
+
+`classes` joins the species of every individual with ';' (repeats included);
+participants.csv has one row per individual with when it joined and left.
+An action whose end was never marked leaves every end_* column, duration_sec
+and the leave columns of individuals still in it empty.
+
+Older <video>_points.csv files (a species and a frame) are still read: each
+point becomes an action with no type yet and a small box around the point.
 
 x is the column (pixels from the left edge) and y is the row (pixels from the
 top edge), both in ORIGINAL video resolution — zooming never changes them.
@@ -12,6 +34,7 @@ top edge), both in ORIGINAL video resolution — zooming never changes them.
 Dependencies: PyQt6, opencv-python, numpy. Nothing else.
 """
 
+import copy
 import csv
 import os
 import sys
@@ -22,14 +45,15 @@ import numpy as np
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QFileDialog, QVBoxLayout,
-    QHBoxLayout, QMessageBox, QSlider, QComboBox, QListWidget, QListWidgetItem,
+    QHBoxLayout, QMessageBox, QSlider, QComboBox, QListWidget, QListWidgetItem, QLineEdit,
     QSizePolicy, QScrollArea, QFrame, QGridLayout, QMenu, QDialog, QStyle,
     QStyleOptionSlider
 )
-from PyQt6.QtGui import QPixmap, QImage, QGuiApplication, QShortcut, QKeySequence
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QUrl
+from PyQt6.QtGui import (QPixmap, QImage, QGuiApplication, QShortcut, QKeySequence,
+                         QRegularExpressionValidator)
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QUrl, QRegularExpression
 
-from app_modules import LabelDialog
+from app_modules import LabelDialog, ActionDialog, color_icon
 
 # Audio is optional: OpenCV decodes no sound at all, so it is played by Qt's
 # multimedia module alongside the frames. A plain `pip install PyQt6` ships it
@@ -54,9 +78,9 @@ SPEEDS = [0.25, 0.5, 1.0, 2.0, 4.0]
 # Per-class display colours (RGB). A class gets a colour by its position in
 # self.classes, so the same class keeps its colour for the whole session and the
 # biologist never has to pick one.
+#
+# No pure red or green: they read as "wrong" / "right" rather than as a species.
 PALETTE = [
-    (255, 0, 0),      # red
-    (0, 255, 0),      # green
     (0, 160, 255),    # blue
     (255, 255, 0),    # yellow
     (255, 0, 255),    # magenta
@@ -64,13 +88,47 @@ PALETTE = [
     (255, 140, 0),    # orange
     (160, 80, 255),   # purple
     (255, 20, 147),   # deep pink
-    (0, 255, 160),    # spring green
+    (255, 255, 255),  # white
+    (140, 200, 255),  # light blue
+    (210, 170, 110),  # tan
 ]
 
 FALLBACK_FPS = 25.0
 
 # Seconds the « / » buttons (and the arrow keys) jump, YouTube-style.
 SKIP_SECONDS = 5.0
+
+# Separator between the classes involved in an action, in the CSV.
+CLASS_SEPARATOR = ";"
+
+# Action types and their display colours (RGB). Change the colours here.
+ACTION_TYPES = [
+    ("Interaction", (230, 57, 70)),     # red
+    ("Passing", (69, 123, 255)),        # blue
+    ("Shelter use", (155, 89, 182)),    # purple
+    ("Foraging", (255, 200, 0)),        # yellow
+    ("Presence", (46, 204, 113)),       # green
+    # Predation, split: moving in on the bait / prey, then eating it
+    ("Approach", (255, 127, 0)),        # orange
+    ("Consume", (255, 64, 160)),        # pink
+]
+ACTION_COLORS = dict(ACTION_TYPES)
+# Types performed by two or more species; the rest take exactly one.
+MULTI_SPECIES_TYPES = {"Interaction"}
+# Actions with no type yet (converted from old points) or an unknown one.
+UNKNOWN_ACTION_COLOR = (190, 190, 190)
+
+# Side length of the box drawn around an old point converted to an action,
+# as a fraction of the frame's shorter side.
+CONVERTED_POINT_BOX = 0.05
+
+# Annotation-list filter: (label, (kinds shown, action type or None)).
+LIST_FILTERS = (
+    [("All", (("bbox", "action"), None)),
+     ("Apparitions", (("bbox",), None)),
+     ("Actions (all types)", (("action",), None))]
+    + [(f"Actions: {name}", (("action",), name)) for name, _color in ACTION_TYPES]
+)
 
 # When the audio clock runs ahead of the decoder by more than this many frames,
 # jump straight there instead of decoding every frame in between.
@@ -120,16 +178,20 @@ def load_stylesheet(file_path):
         return ""
 
 
-def format_time(seconds):
-    """Format a duration in seconds as mm:ss.mmm (hh:mm:ss.mmm past an hour)."""
+def format_time(seconds, millis=True):
+    """Format a duration in seconds as mm:ss.mmm (hh:mm:ss.mmm past an hour);
+    with millis=False, whole seconds only (mm:ss)."""
     if seconds is None or seconds < 0 or not np.isfinite(seconds):
-        return "--:--.---"
+        return "--:--.---" if millis else "--:--"
+    if not millis:
+        seconds = int(seconds)
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     secs = seconds % 60
+    sec_text = f"{secs:06.3f}" if millis else f"{int(secs):02d}"
     if hours:
-        return f"{hours:d}:{minutes:02d}:{secs:06.3f}"
-    return f"{minutes:02d}:{secs:06.3f}"
+        return f"{hours:d}:{minutes:02d}:{sec_text}"
+    return f"{minutes:02d}:{sec_text}"
 
 
 # Subclass QLabel to capture mouse clicks on the frame
@@ -225,7 +287,7 @@ class VideoAnnotator(QWidget):
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("Video Annotator — points & bboxes")
+        self.setWindowTitle("Video Annotator — apparitions & actions")
         screen = QGuiApplication.primaryScreen()
         if screen is not None:
             avail = screen.availableGeometry()
@@ -248,13 +310,29 @@ class VideoAnnotator(QWidget):
         self.speed = 1.0
 
         # ---------------- annotation state ----------------
-        self.tool = None               # None | "point" | "bbox"
+        self.tool = None               # None | "bbox" | "action"
         self.bbox_first_corner = None  # (x, y) in image coords
-        self.points = []               # dicts: frame, time_sec, class_name, x, y
-        self.bboxes = []               # dicts: ... x, y, width, height
+        self.bboxes = []               # dicts: frame, time_sec, class_name, x, y, width, height
+        # dicts: action (type, "" if not set yet), participants, start_frame,
+        # start_box, end_frame, end_box — boxes are (x, y, width, height); the
+        # end ones are None until the end is marked. participants: one dict per
+        # individual — species, join, leave — where join / leave None mean the
+        # action's own start / end, so they follow when those are redrawn.
+        self.actions = []
         self.classes = []              # ordered class names seen so far
-        self.history = []              # ("point"|"bbox", index) for Ctrl+Z
+        # (action index, "start" | "end"): the box the armed Action tool draws
+        # next. Set right after an action is created (its end) and by S / E.
+        self.target = None
+        # For Ctrl+Z: ("add", kind, index) for an added annotation and
+        # ("endpoint", "action", index, which, previous_frame, previous_box)
+        # for a redrawn start / end, ("snapshot", "action", index, old_copy)
+        # for an individual joining / leaving.
+        self.history = []
         self.session_dir = None        # created on the first save of a session
+        # Folder the current annotations were loaded from (None if not loaded)
+        # and how many of its rows belonged to other videos.
+        self.loaded_dir = None
+        self.loaded_skipped = 0
         self.dirty = False
 
         # ---------------- display state ----------------
@@ -330,21 +408,45 @@ class VideoAnnotator(QWidget):
         # afterwards (where arrow keys would change the speed).
         self.speed_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
-        self.status_label = QLabel("frame - / -  —  --:--.--- / --:--.---")
-        self.status_label.setMinimumWidth(300)
+        # Type a frame number and press Enter to go there
+        self.frame_edit = QLineEdit(self)
+        self.frame_edit.setFixedWidth(80)
+        self.frame_edit.setAlignment(Qt.AlignmentFlag.AlignRight)
+        # Digits only (QIntValidator would also let a locale's "." through)
+        self.frame_edit.setValidator(
+            QRegularExpressionValidator(QRegularExpression(r"\d{0,9}"), self))
+        # Only a click gives it the keyboard: as the one focusable widget it
+        # would otherwise grab the focus and swallow the transport keys.
+        self.frame_edit.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.frame_edit.setToolTip("Type a frame number and press Enter to go there")
+        self.frame_edit.returnPressed.connect(self.on_frame_entered)
+        self.frame_edit.setEnabled(False)
+        self.status_label = QLabel("/ -  —  --:-- / --:--")
+        self.status_label.setMinimumWidth(240)
 
         # Annotation tools
-        self.point_button = self._make_button("Point", "point-button-idle", self.toggle_point_tool, width=110)
-        self.bbox_button = self._make_button("BBox", "bbox-button-idle", self.toggle_bbox_tool, width=110)
+        self.bbox_button = self._make_button("Apparition", "bbox-button-idle", self.toggle_bbox_tool, width=120)
+        self.bbox_button.setToolTip("Box an animal on the frame where it appears")
+        self.action_button = self._make_button("Action", "action-button-idle", self.toggle_action_tool, width=120)
+        self.action_button.setToolTip(
+            "Box where an action starts, then box where it ends on its last frame")
         self.hint_label = QLabel("Open a video to start")
 
         # Annotation list panel
         self.annotation_list = QListWidget(self)
         self.annotation_list.setMinimumWidth(280)
-        self.annotation_list.setMaximumWidth(380)
+        self.annotation_list.setMaximumWidth(460)
         self.annotation_list.itemDoubleClicked.connect(self.on_annotation_activated)
         self.annotation_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.annotation_list.customContextMenuRequested.connect(self.on_list_context_menu)
+        # An open action is drawn as in progress only while selected
+        self.annotation_list.currentItemChanged.connect(lambda *_: self.show_frame())
+        self.list_filter_combo = QComboBox(self)
+        for label, kinds in LIST_FILTERS:
+            self.list_filter_combo.addItem(label, kinds)
+        self.list_filter_combo.currentIndexChanged.connect(self.refresh_annotation_list)
+        # Keeps the Up/Down keys for the list itself
+        self.list_filter_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.delete_button = self._make_button("Delete selected", "delete-button", self.delete_selected_annotation, width=150)
 
         # ---------------- layout ----------------
@@ -365,12 +467,14 @@ class VideoAnnotator(QWidget):
         playback_layout.addWidget(self.position_slider, 1)
         playback_layout.addWidget(self.mute_button)
         playback_layout.addWidget(self.speed_combo)
+        playback_layout.addWidget(QLabel("frame"))
+        playback_layout.addWidget(self.frame_edit)
         playback_layout.addWidget(self.status_label)
 
         tools_layout = QHBoxLayout()
         tools_layout.addStretch()
-        tools_layout.addWidget(self.point_button)
         tools_layout.addWidget(self.bbox_button)
+        tools_layout.addWidget(self.action_button)
         tools_layout.addSpacing(20)
         tools_layout.addWidget(self.hint_label)
         tools_layout.addStretch()
@@ -383,7 +487,8 @@ class VideoAnnotator(QWidget):
         frame_grid.addWidget(self.scroll_area, 0, 0)
 
         side_layout = QVBoxLayout()
-        side_layout.addWidget(QLabel("Annotations (double-click to jump)"))
+        side_layout.addWidget(QLabel("Annotations (Enter / double-click to jump)"))
+        side_layout.addWidget(self.list_filter_combo)
         side_layout.addWidget(self.annotation_list, 1)
         side_layout.addWidget(self.delete_button)
 
@@ -456,6 +561,12 @@ class VideoAnnotator(QWidget):
             ("Ctrl+Z", self.undo_last),
             ("Ctrl+S", self.save_csvs),
             ("Delete", self.delete_selected_annotation),
+            ("Return", self._on_return),
+            ("Enter", self._on_return),
+            ("Shift+Return", lambda: self.jump_to_selected_annotation(to_end=True)),
+            ("Shift+Enter", lambda: self.jump_to_selected_annotation(to_end=True)),
+            ("E", self.end_with_key),
+            ("S", self.start_with_key),
             ("Escape", self._on_escape),
         ]
         self._shortcuts = []
@@ -465,6 +576,14 @@ class VideoAnnotator(QWidget):
             shortcut.activated.connect(slot)
             self._shortcuts.append(shortcut)
 
+    def _on_return(self):
+        """Enter: go to the typed frame while the frame field has the focus,
+        otherwise to the annotation selected in the list."""
+        if self.frame_edit.hasFocus():
+            self.on_frame_entered()
+        else:
+            self.jump_to_selected_annotation()
+
     def _set_button_class(self, button, qss_class):
         button.setProperty("class", qss_class)
         button.style().unpolish(button)
@@ -473,10 +592,12 @@ class VideoAnnotator(QWidget):
     def _set_controls_enabled(self, enabled):
         for widget in (self.play_button, self.step_back_button, self.step_fwd_button,
                        self.skip_back_button, self.skip_fwd_button,
-                       self.point_button, self.bbox_button, self.save_button,
+                       self.bbox_button, self.action_button,
+                       self.save_button,
                        self.load_button, self.delete_button):
             widget.setEnabled(enabled)
         self.speed_combo.setEnabled(enabled)
+        self.frame_edit.setEnabled(enabled)
         self.position_slider.setEnabled(enabled and self.total_frames > 0)
         self.frame_label.interactions_enabled = enabled
         self._refresh_mute_button()
@@ -513,13 +634,16 @@ class VideoAnnotator(QWidget):
         self.total_frames = int(total) if total and np.isfinite(total) and total > 0 else 0
 
         # Reset annotation + display state for the new video
-        self.points = []
         self.bboxes = []
+        self.actions = []
         self.classes = []
         self.history = []
         self.dirty = False
         self.session_dir = None        # a new video starts a new session folder
+        self.loaded_dir = None
+        self.loaded_skipped = 0
         self.tool = None
+        self.target = None
         self.bbox_first_corner = None
         self.frame_idx = -1
         self.current_frame = None
@@ -546,7 +670,7 @@ class VideoAnnotator(QWidget):
             f"{self.video_name}  —  {self.fps:g} fps, {length_txt}"
             + (f", {format_time(duration)}" if duration else "")
         )
-        self.hint_label.setText("Pause, then arm Point or BBox to annotate")
+        self.hint_label.setText("Pause, then press Apparition or Action to annotate")
 
         if not self.seek_to(0):
             QMessageBox.critical(self, "Error", "Could not read the first frame of the video.")
@@ -761,20 +885,33 @@ class VideoAnnotator(QWidget):
 
     def update_status(self):
         if self.cap is None:
-            self.status_label.setText("frame - / -  —  --:--.--- / --:--.---")
+            self.frame_edit.clear()
+            self.status_label.setText("/ -  —  --:-- / --:--")
             return
         total_txt = str(self.total_frames) if self.total_frames else "?"
         current_time = self.frame_idx / self.fps if self.frame_idx >= 0 else 0.0
         total_time = self.total_frames / self.fps if self.total_frames else None
-        total_time_txt = format_time(total_time) if total_time else "--:--.---"
+        total_time_txt = format_time(total_time, millis=False) if total_time else "--:--"
+        # Leave the field alone while the user is typing a frame into it
+        if not self.frame_edit.hasFocus():
+            self.frame_edit.setText(str(self.frame_idx))
         self.status_label.setText(
-            f"frame {self.frame_idx} / {total_txt}  —  "
-            f"{format_time(current_time)} / {total_time_txt}"
-        )
+            f"/ {total_txt}  —  {format_time(current_time, millis=False)} / {total_time_txt}")
         if self.total_frames:
             self.position_slider.blockSignals(True)
             self.position_slider.setValue(min(self.frame_idx, self.total_frames - 1))
             self.position_slider.blockSignals(False)
+
+    def on_frame_entered(self):
+        text = self.frame_edit.text().strip()
+        # Hand the keyboard back to the video so the transport keys work again
+        self.setFocus()
+        if self.cap is None or not text:
+            self.update_status()
+            return
+        self.pause()
+        self.seek_to(int(text))
+        self.update_status()     # shows the clamped frame if it was past the end
 
     # ------------------------------------------------------------------
     # rendering
@@ -809,23 +946,15 @@ class VideoAnnotator(QWidget):
         cv2.rectangle(image, (tx, ty - th - baseline - 2), (tx + tw + 4, ty + 2), (0, 0, 0), -1)
         cv2.putText(image, text, (tx + 2, ty - baseline + 1), font, scale, color, thickness, cv2.LINE_AA)
 
+    def action_color(self, action_type):
+        return ACTION_COLORS.get(action_type, UNKNOWN_ACTION_COLOR)
+
     def build_overlay(self, cursor_point=None):
-        """Current frame plus the annotations that belong to this frame."""
+        """Current frame plus the annotations visible on this frame."""
         overlay = self.current_frame.copy()
         s = self._draw_scale()
-        radius = max(3, int(round(5 * s)))
         thickness = max(1, int(round(2 * s)))
         arm = max(6, int(round(8 * s)))
-
-        for ann in self.points:
-            if ann["frame"] != self.frame_idx:
-                continue
-            color = self.class_color(ann["class_name"])
-            cv2.circle(overlay, (ann["x"], ann["y"]), radius, color, -1)
-            cv2.circle(overlay, (ann["x"], ann["y"]), radius + 2, (255, 255, 255),
-                       max(1, thickness // 2))
-            self._draw_caption(overlay, ann["class_name"],
-                               (ann["x"] + arm, ann["y"] - arm // 2), color)
 
         for ann in self.bboxes:
             if ann["frame"] != self.frame_idx:
@@ -835,8 +964,13 @@ class VideoAnnotator(QWidget):
             cv2.rectangle(overlay, (x, y), (x + w, y + h), color, thickness)
             self._draw_caption(overlay, ann["class_name"], (x, y - thickness), color)
 
-        # Rubber band between the first and second bbox click
-        if self.tool == "bbox" and self.bbox_first_corner is not None:
+        banner = self._draw_actions(overlay, thickness)
+        line_h = int(round(22 * s))
+        for i, (text, color) in enumerate(banner):
+            self._draw_caption(overlay, text, (4, line_h * (i + 1)), color)
+
+        # Rubber band between the first and second corner click
+        if self.tool is not None and self.bbox_first_corner is not None:
             cx, cy = self.bbox_first_corner
             if cursor_point is not None:
                 x1, x2 = sorted((cx, cursor_point[0]))
@@ -846,6 +980,106 @@ class VideoAnnotator(QWidget):
             cv2.line(overlay, (cx, cy - arm), (cx, cy + arm), (0, 255, 255), thickness)
 
         return overlay
+
+    @staticmethod
+    def _interval_active(start, end, frame):
+        """True when `frame` lies inside [start, end] (open ones never end)."""
+        if frame < start:
+            return False
+        return end is None or frame <= end
+
+    def _shown_on_frame(self, index, ann):
+        """Is this action drawn on the current frame?
+
+        A closed one shows over its whole interval. An open one would otherwise
+        cover every later frame — and old points load as open actions — so it
+        shows past its start only while it is being worked on: waiting for its
+        end box, or selected in the list.
+        """
+        start, end = ann["start_frame"], ann["end_frame"]
+        worked_on = (self.target is not None and self.target[0] == index) or \
+            self._selected_annotation() == ("action", index)
+        if end is None and not worked_on:
+            end = start
+        return self._interval_active(start, end, self.frame_idx)
+
+    @staticmethod
+    def _action_box_at(ann, frame):
+        """The action's box on `frame`: its start box, sliding linearly towards
+        its end box across the interval (a guide only — just the two ends are
+        annotated)."""
+        start_box, end_box = ann["start_box"], ann["end_box"]
+        start, end = ann["start_frame"], ann["end_frame"]
+        if end_box is None or end is None:
+            return start_box
+        if end <= start:
+            return end_box if frame >= end else start_box
+        t = min(1.0, max(0.0, (frame - start) / (end - start)))
+        return tuple(int(round(a + (b - a) * t)) for a, b in zip(start_box, end_box))
+
+    @staticmethod
+    def _span_text(start, end):
+        return f"f{start}-" + ("open" if end is None else f"f{end}")
+
+    @staticmethod
+    def _participant_span(ann, participant):
+        """(join, leave) frames of an individual; leave None while open."""
+        join = participant["join"] if participant["join"] is not None else ann["start_frame"]
+        leave = participant["leave"] if participant["leave"] is not None else ann["end_frame"]
+        return join, leave
+
+    def _active_participants(self, ann, frame):
+        return [p for p in ann["participants"]
+                if self._interval_active(*self._participant_span(ann, p), frame)]
+
+    @staticmethod
+    def _species_text(species):
+        """'Carcinus maenas ×2 + Libinia emarginata' — counts, first-seen order."""
+        counts = {}
+        for name in species:
+            counts[name] = counts.get(name, 0) + 1
+        return " + ".join(name if n == 1 else f"{name} ×{n}" for name, n in counts.items())
+
+    def _action_label(self, ann, frame=None):
+        """Type and individuals; with `frame`, only those in it on that frame."""
+        people = (ann["participants"] if frame is None
+                  else self._active_participants(ann, frame))
+        return f"{ann['action'] or '?'}: {self._species_text([p['species'] for p in people])}"
+
+    def _draw_dashed_rect(self, image, p1, p2, color, thickness):
+        (x1, y1), (x2, y2) = p1, p2
+        dash = max(6, thickness * 4)
+        for a, b, fixed, horizontal in ((x1, x2, y1, True), (x1, x2, y2, True),
+                                        (y1, y2, x1, False), (y1, y2, x2, False)):
+            for start in range(a, b, dash * 2):
+                end = min(start + dash, b)
+                if horizontal:
+                    cv2.line(image, (start, fixed), (end, fixed), color, thickness)
+                else:
+                    cv2.line(image, (fixed, start), (fixed, end), color, thickness)
+
+    def _draw_actions(self, overlay, thickness):
+        """Solid boxes on an action's first and last frame, a dashed guide box
+        in between. Returns the lines of the in-progress banner."""
+        banner = []
+        for i, ann in enumerate(self.actions):
+            if not self._shown_on_frame(i, ann):
+                continue
+            color = self.action_color(ann["action"])
+            label = self._action_label(ann, self.frame_idx)
+            x, y, w, h = self._action_box_at(ann, self.frame_idx)
+            if self.frame_idx == ann["start_frame"]:
+                cv2.rectangle(overlay, (x, y), (x + w, y + h), color, thickness * 2)
+                self._draw_caption(overlay, f"START {label}", (x, y - thickness), color)
+            elif self.frame_idx == ann["end_frame"]:
+                cv2.rectangle(overlay, (x, y), (x + w, y + h), color, thickness * 2)
+                self._draw_caption(overlay, f"END {label}", (x, y - thickness), color)
+            else:
+                self._draw_dashed_rect(overlay, (x, y), (x + w, y + h), color,
+                                       max(1, thickness // 2))
+            banner.append((f"{label}  {self._span_text(ann['start_frame'], ann['end_frame'])}",
+                           color))
+        return banner
 
     def show_frame(self, cursor_point=None):
         if self.current_frame is None:
@@ -964,27 +1198,46 @@ class VideoAnnotator(QWidget):
     # annotation tools
     # ------------------------------------------------------------------
     def _refresh_tool_buttons(self):
-        self._set_button_class(
-            self.point_button,
-            "point-button-active" if self.tool == "point" else "point-button-idle")
+        which = self.target[1] if self.target else None
+        self.action_button.setText(
+            {"end": "End action…", "start": "Start box…"}.get(which, "Action"))
         self._set_button_class(
             self.bbox_button,
             "bbox-button-active" if self.tool == "bbox" else "bbox-button-idle")
+        self._set_button_class(
+            self.action_button,
+            "action-button-active" if self.tool == "action" else "action-button-idle")
         if self.tool is None:
             self.frame_label.setCursor(Qt.CursorShape.ArrowCursor)
         else:
             self.frame_label.setCursor(Qt.CursorShape.CrossCursor)
 
     def _on_escape(self):
-        """Esc disarms the tool / cancels a half-drawn box, and nothing else."""
-        if self.tool is not None or self.bbox_first_corner is not None:
-            self.set_tool(None)
-
-    def toggle_point_tool(self):
-        self.set_tool(None if self.tool == "point" else "point")
+        """Esc disarms the tool / cancels a half-drawn box, and nothing else.
+        An action waiting for its end box stays in the list, open."""
+        if self.frame_edit.hasFocus():
+            # Abandon the typed frame number
+            self.setFocus()
+            self.update_status()
+            return
+        if self.tool is None and self.bbox_first_corner is None:
+            return
+        target = self.target
+        self.set_tool(None)
+        if target is not None and target[0] < len(self.actions) \
+                and self.actions[target[0]]["end_frame"] is None:
+            self.hint_label.setText(
+                "Left open — select it and press E on its last frame to draw the end box")
 
     def toggle_bbox_tool(self):
         self.set_tool(None if self.tool == "bbox" else "bbox")
+
+    def toggle_action_tool(self):
+        # While it waits for a box, pressing it again is the same as Esc
+        if self.tool == "action":
+            self._on_escape()
+        else:
+            self.set_tool("action")
 
     def set_tool(self, tool):
         if self.cap is None:
@@ -992,14 +1245,32 @@ class VideoAnnotator(QWidget):
         if tool is not None:
             self.pause()          # annotation always happens on a paused frame
         self.tool = tool
+        self.target = None
         self.bbox_first_corner = None
         self._refresh_tool_buttons()
-        if tool == "point":
-            self.hint_label.setText("Click the animal to place a point")
-        elif tool == "bbox":
+        if tool == "bbox":
             self.hint_label.setText("Click two opposite corners of the box")
+        elif tool == "action":
+            self.hint_label.setText(
+                "On the frame where the action starts, click two corners around it")
         else:
             self.hint_label.setText("Tool disarmed")
+        self.show_frame()
+
+    def _arm_endpoint(self, index, which):
+        """Arm the Action tool to draw the start or end box of an action."""
+        self.set_tool("action")
+        self.target = (index, which)
+        self._refresh_tool_buttons()
+        ann = self.actions[index]
+        if which == "end":
+            self.hint_label.setText(
+                f"{self._action_label(ann)} — on its LAST frame, click two corners "
+                f"around where it ends (Esc: leave it open)")
+        else:
+            self.hint_label.setText(
+                f"{self._action_label(ann)} — on its FIRST frame, click two corners "
+                f"around where it starts (Esc: cancel)")
         self.show_frame()
 
     def on_frame_clicked(self, pos):
@@ -1009,14 +1280,7 @@ class VideoAnnotator(QWidget):
         if point is None:
             return
 
-        if self.tool == "point":
-            class_name = self.ask_class_name()
-            if class_name is None:
-                return
-            self.add_point(point[0], point[1], class_name)
-            return
-
-        # bbox: click 1 = first corner, click 2 = opposite corner
+        # Both tools draw a box: click 1 = first corner, click 2 = opposite corner
         if self.bbox_first_corner is None:
             self.bbox_first_corner = point
             self.hint_label.setText("Click the opposite corner")
@@ -1028,18 +1292,32 @@ class VideoAnnotator(QWidget):
         if x2 - x1 < 2 or y2 - y1 < 2:
             self.hint_label.setText("Box too small — click a wider opposite corner")
             return
+        box = (x1, y1, x2 - x1, y2 - y1)
+        self.bbox_first_corner = None
+
+        if self.tool == "action":
+            if self.target is not None:
+                self.set_endpoint(*self.target, box)
+                return
+            details = self.ask_action_details()
+            if details is None:
+                self.hint_label.setText("Action discarded")
+                self.show_frame()
+                return
+            self.add_action(box, *details)
+            self._arm_endpoint(len(self.actions) - 1, "end")
+            return
 
         class_name = self.ask_class_name()
-        self.bbox_first_corner = None
         if class_name is None:
             self.hint_label.setText("Box discarded")
             self.show_frame()
             return
-        self.add_bbox(x1, y1, x2 - x1, y2 - y1, class_name)
+        self.add_bbox(*box, class_name)
         self.hint_label.setText("Click two opposite corners of the box")
 
     def on_mouse_moved(self, pos):
-        if self.tool != "bbox" or self.bbox_first_corner is None:
+        if self.tool is None or self.bbox_first_corner is None:
             return
         point = self.get_image_coordinates(pos)
         if point is None:
@@ -1055,24 +1333,37 @@ class VideoAnnotator(QWidget):
         name = (dialog.selected_label or "").strip()
         return name or None
 
+    def ask_action_details(self, current=None):
+        """Ask for the action type and the species performing it.
+
+        Returns (type, [classes]) or None when cancelled. `current` is the
+        action being edited; a new action starts from the previous one's
+        answers, since the same action tends to be annotated in a row.
+        """
+        template = current or (self.actions[-1] if self.actions else None)
+        dialog = ActionDialog(
+            ACTION_TYPES, self.classes, self,
+            preselect_action=template["action"] if template else None,
+            preselect_classes=[p["species"] for p in template["participants"]] if template else None,
+            multi_species_types=MULTI_SPECIES_TYPES,
+            unknown_color=UNKNOWN_ACTION_COLOR)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.selected_action, dialog.selected_classes
+
     def _register_class(self, class_name):
         if class_name not in self.classes:
             self.classes.append(class_name)
 
-    def add_point(self, x, y, class_name):
-        self._register_class(class_name)
-        self.points.append({
-            "frame": self.frame_idx,
-            "time_sec": self.frame_idx / self.fps,
-            "class_name": class_name,
-            "x": int(x),
-            "y": int(y),
-        })
-        self.history.append(("point", len(self.points) - 1))
-        self.dirty = True
-        self.refresh_annotation_list()
-        self.show_frame()
-        self.hint_label.setText(f"Point '{class_name}' at frame {self.frame_idx}")
+    def _store(self, kind):
+        return {"bbox": self.bboxes, "action": self.actions}[kind]
+
+    @staticmethod
+    def _start_frame(kind, ann):
+        return ann["start_frame"] if kind == "action" else ann["frame"]
+
+    def _name(self, kind, ann):
+        return self._action_label(ann) if kind == "action" else ann["class_name"]
 
     def add_bbox(self, x, y, width, height, class_name):
         self._register_class(class_name)
@@ -1085,57 +1376,246 @@ class VideoAnnotator(QWidget):
             "width": int(width),
             "height": int(height),
         })
-        self.history.append(("bbox", len(self.bboxes) - 1))
+        self.history.append(("add", "bbox", len(self.bboxes) - 1))
         self.dirty = True
         self.refresh_annotation_list()
         self.show_frame()
 
+    @staticmethod
+    def _new_participants(species):
+        return [{"species": name, "join": None, "leave": None} for name in species]
+
+    def add_action(self, box, action, species):
+        for name in species:
+            self._register_class(name)
+        self.actions.append({
+            "action": action,
+            "participants": self._new_participants(species),
+            "start_frame": self.frame_idx,
+            "start_box": tuple(int(v) for v in box),
+            "end_frame": None,
+            "end_box": None,
+        })
+        self.history.append(("add", "action", len(self.actions) - 1))
+        self.dirty = True
+        self.refresh_annotation_list(select=("action", len(self.actions) - 1))
+        self.show_frame()
+
+    def set_endpoint(self, index, which, box):
+        """Put the start or end of an action on the current frame, with `box`."""
+        if index >= len(self.actions):
+            return False
+        ann = self.actions[index]
+        frame = self.frame_idx
+        if which == "end" and frame < ann["start_frame"]:
+            self.hint_label.setText(
+                f"It starts at frame {ann['start_frame']} — draw its end box on a later frame")
+            self.show_frame()
+            return False
+        if which == "start" and ann["end_frame"] is not None and frame > ann["end_frame"]:
+            self.hint_label.setText(
+                f"It ends at frame {ann['end_frame']} — draw its start box on an earlier frame")
+            self.show_frame()
+            return False
+        self.history.append(("endpoint", "action", index, which,
+                             ann[f"{which}_frame"], ann[f"{which}_box"]))
+        ann[f"{which}_frame"] = frame
+        ann[f"{which}_box"] = tuple(int(v) for v in box)
+        self.dirty = True
+        self.set_tool(None)
+        self.refresh_annotation_list(select=("action", index))
+        self.show_frame()
+        text = f"{self._action_label(ann)}  {self._span_text(ann['start_frame'], ann['end_frame'])}"
+        if ann["end_frame"] is not None:
+            text += f" ({(ann['end_frame'] - ann['start_frame']) / self.fps:.2f}s)"
+        self.hint_label.setText(text)
+        return True
+
+    def participant_joins(self, index):
+        """A new individual joins the action on the current frame."""
+        ann = self.actions[index]
+        frame = self.frame_idx
+        if not self._interval_active(ann["start_frame"], ann["end_frame"], frame):
+            self.hint_label.setText("Go to a frame inside the action first")
+            return
+        species = self.ask_class_name()
+        if species is None:
+            return
+        self._register_class(species)
+        self.history.append(("snapshot", "action", index, copy.deepcopy(ann)))
+        ann["participants"].append(
+            {"species": species, "join": None if frame == ann["start_frame"] else frame,
+             "leave": None})
+        self.dirty = True
+        self.refresh_annotation_list(select=("action", index))
+        self.show_frame()
+        self.hint_label.setText(f"{species} joins at frame {frame} — {self._action_label(ann, frame)}")
+
+    def participant_leaves(self, index, individual):
+        """Individual number `individual` leaves the action on the current frame."""
+        ann = self.actions[index]
+        participant = ann["participants"][individual]
+        join, _leave = self._participant_span(ann, participant)
+        frame = self.frame_idx
+        if frame < join:
+            self.hint_label.setText(f"It joined at frame {join} — it must leave after that")
+            return
+        self.history.append(("snapshot", "action", index, copy.deepcopy(ann)))
+        participant["leave"] = None if frame == ann["end_frame"] else frame
+        self.dirty = True
+        self.refresh_annotation_list(select=("action", index))
+        self.show_frame()
+        self.hint_label.setText(
+            f"{participant['species']} leaves at frame {frame} — {self._action_label(ann, frame)}")
+
+    def _endpoint_with_key(self, which):
+        """S / E: redraw the start / end box of the selected action (or of the
+        action the tool is already waiting for) on the current frame."""
+        if self.cap is None:
+            return
+        if self.target is not None:
+            index = self.target[0]
+        else:
+            selected = self._selected_annotation()
+            if selected is None or selected[0] != "action":
+                self.hint_label.setText("Select an action in the list first")
+                return
+            index = selected[1]
+        self._arm_endpoint(index, which)
+
+    def start_with_key(self):
+        self._endpoint_with_key("start")
+
+    def end_with_key(self):
+        self._endpoint_with_key("end")
+
     def undo_last(self):
-        """Remove the most recently added annotation."""
+        """Remove the most recently added annotation (or redrawn start / end)."""
         while self.history:
-            kind, index = self.history.pop()
-            store = self.points if kind == "point" else self.bboxes
-            if index < len(store):
-                removed = store.pop(index)
-                self._reindex_history(kind, index)
+            entry = self.history.pop()
+            op, kind, index = entry[:3]
+            store = self._store(kind)
+            if index >= len(store):
+                continue
+            if op == "snapshot":
+                store[index] = entry[3]
                 self.dirty = True
                 self.refresh_annotation_list()
                 self.show_frame()
-                self.hint_label.setText(
-                    f"Undid {kind} '{removed['class_name']}' at frame {removed['frame']}")
+                self.hint_label.setText(f"Undid the change to {self._name(kind, entry[3])}")
                 return
+            if op == "endpoint":
+                which, prev_frame, prev_box = entry[3:]
+                ann = store[index]
+                ann[f"{which}_frame"] = prev_frame
+                ann[f"{which}_box"] = prev_box
+                self.dirty = True
+                self.refresh_annotation_list()
+                self.show_frame()
+                self.hint_label.setText(f"Undid the {which} of {self._name(kind, ann)}")
+                return
+            removed = store.pop(index)
+            self._reindex_history(kind, index)
+            self.dirty = True
+            self.refresh_annotation_list()
+            self.show_frame()
+            self.hint_label.setText(
+                f"Undid {self.KIND_LABELS[kind].lower()} '{self._name(kind, removed)}' "
+                f"at frame {self._start_frame(kind, removed)}")
+            return
         self.hint_label.setText("Nothing to undo")
 
     def _reindex_history(self, kind, removed_index):
-        """Keep undo indices valid after an annotation is removed."""
+        """Keep undo indices (and the tool's target) valid after an annotation
+        is removed."""
         updated = []
-        for h_kind, h_index in self.history:
+        for entry in self.history:
+            op, h_kind, h_index = entry[:3]
             if h_kind == kind:
                 if h_index == removed_index:
                     continue
                 if h_index > removed_index:
-                    h_index -= 1
-            updated.append((h_kind, h_index))
+                    entry = (op, h_kind, h_index - 1) + tuple(entry[3:])
+            updated.append(entry)
         self.history = updated
+
+        if kind == "action" and self.target is not None:
+            if self.target[0] == removed_index:
+                # What the tool was waiting for is gone: back to a new action
+                self.target = None
+                self._refresh_tool_buttons()
+            elif self.target[0] > removed_index:
+                self.target = (self.target[0] - 1, self.target[1])
 
     # ------------------------------------------------------------------
     # annotation list / editing
     # ------------------------------------------------------------------
-    def refresh_annotation_list(self):
+    KIND_LABELS = {"bbox": "Apparition", "action": "Action"}
+
+    @staticmethod
+    def _list_time_text(seconds):
+        """h:m:s plus whole seconds, truncated so they agree with the h:m:s."""
+        return f"{format_time(seconds)} ({int(seconds)}s)"
+
+    def _list_entry_text(self, kind, ann):
+        """Type first, then the species, then when — frame numbers are left to
+        the tooltip (see _list_entry_tooltip)."""
+        start = self._start_frame(kind, ann)
+        when = self._list_time_text(start / self.fps)
+        if kind == "bbox":
+            return (f"Apparition  ·  {ann['class_name']}  ·  {when}  "
+                    f"({ann['x']}, {ann['y']}) {ann['width']}×{ann['height']}")
+        if ann["end_frame"] is None:
+            when += " → OPEN"
+        else:
+            when += (f" → {self._list_time_text(ann['end_frame'] / self.fps)}  "
+                     f"[{(ann['end_frame'] - start) / self.fps:.2f}s]")
+        species = self._species_text([p["species"] for p in ann["participants"]])
+        return f"{ann['action'] or '?'}  ·  {species}  ·  {when}"
+
+    def _list_entry_tooltip(self, kind, ann):
+        start = self._start_frame(kind, ann)
+        if kind == "bbox":
+            return f"Frame {start}"
+        tip = f"Frames {self._span_text(start, ann['end_frame'])}"
+        if len(ann["participants"]) > 1:
+            for i, p in enumerate(ann["participants"]):
+                tip += f"\n  #{i + 1} {p['species']}  {self._span_text(*self._participant_span(ann, p))}"
+        if not ann["action"]:
+            tip += "\nNo action type yet: right-click → Edit action"
+        if ann["end_frame"] is None:
+            tip += "\nOpen: go to its last frame and press E to draw its end box"
+        return tip
+
+    def _list_entry_icon(self, kind, ann):
+        if kind == "bbox":
+            return color_icon(self.class_color(ann["class_name"]))
+        return color_icon(self.action_color(ann["action"]))
+
+    def refresh_annotation_list(self, *_args, select=None):
+        """Rebuild the list, keeping the selection (or selecting `select`)."""
+        if select is None:
+            select = self._selected_annotation()
+        kinds, action_type = self.list_filter_combo.currentData() or LIST_FILTERS[0][1]
+        entries = []
+        for kind in kinds:
+            for i, ann in enumerate(self._store(kind)):
+                if action_type is not None and ann["action"] != action_type:
+                    continue
+                entries.append((self._start_frame(kind, ann), kind, i, ann))
+        entries.sort(key=lambda e: e[:3])
+
+        self.annotation_list.blockSignals(True)
         self.annotation_list.clear()
-        entries = ([("point", i, a) for i, a in enumerate(self.points)]
-                   + [("bbox", i, a) for i, a in enumerate(self.bboxes)])
-        entries.sort(key=lambda e: (e[2]["frame"], e[0], e[1]))
-        for kind, index, ann in entries:
-            if kind == "point":
-                detail = f"({ann['x']}, {ann['y']})"
-            else:
-                detail = f"({ann['x']}, {ann['y']}) {ann['width']}×{ann['height']}"
-            item = QListWidgetItem(
-                f"f{ann['frame']}  {format_time(ann['time_sec'])}  "
-                f"{ann['class_name']}  [{kind}] {detail}")
+        for _frame, kind, index, ann in entries:
+            item = QListWidgetItem(self._list_entry_icon(kind, ann),
+                                   self._list_entry_text(kind, ann))
             item.setData(Qt.ItemDataRole.UserRole, (kind, index))
+            item.setToolTip(self._list_entry_tooltip(kind, ann))
             self.annotation_list.addItem(item)
+            if (kind, index) == select:
+                self.annotation_list.setCurrentItem(item)
+        self.annotation_list.blockSignals(False)
 
     def _selected_annotation(self):
         item = self.annotation_list.currentItem()
@@ -1144,14 +1624,28 @@ class VideoAnnotator(QWidget):
         return item.data(Qt.ItemDataRole.UserRole)
 
     def on_annotation_activated(self, item):
-        kind, index = item.data(Qt.ItemDataRole.UserRole)
-        store = self.points if kind == "point" else self.bboxes
-        if index < len(store):
-            self.pause()
-            self.seek_to(store[index]["frame"])
+        self.jump_to_annotation(*item.data(Qt.ItemDataRole.UserRole))
+
+    def jump_to_selected_annotation(self, to_end=False):
+        """Enter jumps to the selected annotation; Shift+Enter to its end."""
+        selected = self._selected_annotation()
+        if selected is None:
+            return
+        self.jump_to_annotation(*selected, to_end=to_end)
+
+    def jump_to_annotation(self, kind, index, to_end=False):
+        store = self._store(kind)
+        if self.cap is None or index >= len(store):
+            return
+        ann = store[index]
+        frame = self._start_frame(kind, ann)
+        if to_end and ann.get("end_frame") is not None:
+            frame = ann["end_frame"]
+        self.pause()
+        self.seek_to(frame)
 
     def delete_annotation(self, kind, index):
-        store = self.points if kind == "point" else self.bboxes
+        store = self._store(kind)
         if index >= len(store):
             return
         removed = store.pop(index)
@@ -1160,7 +1654,8 @@ class VideoAnnotator(QWidget):
         self.refresh_annotation_list()
         self.show_frame()
         self.hint_label.setText(
-            f"Deleted {kind} '{removed['class_name']}' at frame {removed['frame']}")
+            f"Deleted {self.KIND_LABELS[kind].lower()} '{self._name(kind, removed)}' "
+            f"at frame {self._start_frame(kind, removed)}")
 
     def delete_selected_annotation(self):
         selected = self._selected_annotation()
@@ -1170,8 +1665,29 @@ class VideoAnnotator(QWidget):
         self.delete_annotation(*selected)
 
     def change_annotation_class(self, kind, index):
-        store = self.points if kind == "point" else self.bboxes
+        store = self._store(kind)
         if index >= len(store):
+            return
+        if kind == "action":
+            details = self.ask_action_details(current=store[index])
+            if details is None:
+                return
+            ann = store[index]
+            self.history.append(("snapshot", "action", index, copy.deepcopy(ann)))
+            ann["action"] = details[0]
+            # Individual i keeps its join / leave frames; extra ones span the
+            # whole action, missing ones are dropped
+            old = ann["participants"]
+            ann["participants"] = [
+                {"species": name,
+                 "join": old[i]["join"] if i < len(old) else None,
+                 "leave": old[i]["leave"] if i < len(old) else None}
+                for i, name in enumerate(details[1])]
+            for name in details[1]:
+                self._register_class(name)
+            self.dirty = True
+            self.refresh_annotation_list()
+            self.show_frame()
             return
         dialog = LabelDialog(self.classes, self, preselect=store[index]["class_name"])
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -1194,7 +1710,7 @@ class VideoAnnotator(QWidget):
         self._show_annotation_menu(self.annotation_list.mapToGlobal(pos), kind, index)
 
     def on_frame_right_clicked(self, pos):
-        """Right-click on an annotation of the current frame: delete / relabel."""
+        """Right-click on an annotation of the current frame: edit / delete."""
         point = self.get_image_coordinates(pos)
         if point is None:
             return
@@ -1205,38 +1721,76 @@ class VideoAnnotator(QWidget):
 
     def _show_annotation_menu(self, global_pos, kind, index):
         menu = QMenu(self)
-        change_action = menu.addAction("Change class")
+        change_action = menu.addAction("Edit action…" if kind == "action" else "Change class")
+        start_here = end_here = start_jump = end_jump = join_here = None
+        leave_actions = {}
+        if kind == "action" and self.actions[index]["action"] in MULTI_SPECIES_TYPES:
+            ann = self.actions[index]
+            join_here = menu.addAction(f"Individual joins on this frame ({self.frame_idx})…")
+            leave_menu = menu.addMenu(f"Individual leaves on this frame ({self.frame_idx})")
+            for i, participant in enumerate(ann["participants"]):
+                if participant in self._active_participants(ann, self.frame_idx):
+                    leave_actions[leave_menu.addAction(
+                        f"#{i + 1}  {participant['species']}")] = i
+            leave_menu.setEnabled(bool(leave_actions))
+            menu.addSeparator()
+        if kind == "action":
+            start_here = menu.addAction(f"Redraw start box on this frame ({self.frame_idx})  S")
+            end_here = menu.addAction(f"Redraw end box on this frame ({self.frame_idx})  E")
+            start_jump = menu.addAction("Jump to start")
+            end_jump = menu.addAction("Jump to end")
+            end_jump.setEnabled(self.actions[index]["end_frame"] is not None)
         delete_action = menu.addAction("Delete")
         action = menu.exec(global_pos)
+        if action is None:
+            return
         if action == delete_action:
             self.delete_annotation(kind, index)
         elif action == change_action:
             self.change_annotation_class(kind, index)
+        elif action == join_here:
+            self.participant_joins(index)
+        elif action in leave_actions:
+            self.participant_leaves(index, leave_actions[action])
+        elif action == start_here:
+            self._arm_endpoint(index, "start")
+        elif action == end_here:
+            self._arm_endpoint(index, "end")
+        elif action == start_jump:
+            self.jump_to_annotation(kind, index)
+        elif action == end_jump:
+            self.jump_to_annotation(kind, index, to_end=True)
 
     def annotation_at(self, point):
-        """Annotation of the current frame under (x, y), or None."""
+        """Annotation drawn on the current frame under (x, y), or None."""
         x, y = point
-        tolerance = max(8, int(round(8 * self._draw_scale())))
-        for i, ann in enumerate(self.points):
-            if ann["frame"] != self.frame_idx:
-                continue
-            if abs(ann["x"] - x) <= tolerance and abs(ann["y"] - y) <= tolerance:
-                return ("point", i)
         for i, ann in enumerate(self.bboxes):
             if ann["frame"] != self.frame_idx:
                 continue
             if (ann["x"] <= x <= ann["x"] + ann["width"]
                     and ann["y"] <= y <= ann["y"] + ann["height"]):
                 return ("bbox", i)
+        for i, ann in enumerate(self.actions):
+            if not self._shown_on_frame(i, ann):
+                continue
+            bx, by, bw, bh = self._action_box_at(ann, self.frame_idx)
+            if bx <= x <= bx + bw and by <= y <= by + bh:
+                return ("action", i)
         return None
 
     # ------------------------------------------------------------------
     # CSV import / export
     # ------------------------------------------------------------------
     def _csv_paths(self, directory):
+        """points (legacy, read only), bboxes and actions CSV paths."""
         stem = os.path.splitext(self.video_name)[0]
         return (os.path.join(directory, f"{stem}_points.csv"),
-                os.path.join(directory, f"{stem}_bboxes.csv"))
+                os.path.join(directory, f"{stem}_bboxes.csv"),
+                os.path.join(directory, f"{stem}_actions.csv"))
+
+    def _participants_path(self, directory):
+        stem = os.path.splitext(self.video_name)[0]
+        return os.path.join(directory, f"{stem}_participants.csv")
 
     def _annotations_root(self):
         """Parent folder holding one sub-folder per annotation session.
@@ -1259,8 +1813,9 @@ class VideoAnnotator(QWidget):
 
         Created on the first save and reused for every later save of the same
         session, so re-saving updates the same files while a *new* session (or
-        a session resumed from loaded CSVs) always gets its own folder and can
-        never overwrite earlier work.
+        a session resumed from loaded CSVs) gets its own folder and never
+        overwrites earlier work — unless the user chose to overwrite the loaded
+        CSVs, in which case session_dir already points at their folder.
         """
         if self.session_dir and os.path.isdir(self.session_dir):
             return self.session_dir
@@ -1278,28 +1833,42 @@ class VideoAnnotator(QWidget):
         self.session_dir = path
         return path
 
+    ACTION_COLUMNS = ["action_id", "video_name", "action", "classes", "individuals",
+                      "start_frame", "start_time_sec", "end_frame", "end_time_sec", "duration_sec",
+                      "start_x", "start_y", "start_width", "start_height",
+                      "end_x", "end_y", "end_width", "end_height"]
+
+    PARTICIPANT_COLUMNS = ["action_id", "video_name", "action", "individual", "class_name",
+                           "join_frame", "join_time_sec", "leave_frame", "leave_time_sec"]
+
+    def _frame_columns(self, frame):
+        """frame, time_sec — both empty for a frame not marked yet."""
+        return ["", ""] if frame is None else [frame, f"{frame / self.fps:.3f}"]
+
     def save_csvs(self):
         if self.cap is None:
             return
-        if not self.points and not self.bboxes:
+        if not self.bboxes and not self.actions:
             QMessageBox.information(self, "Nothing to save", "No annotations yet.")
             return
+
+        if self.session_dir is None and self.loaded_dir is not None:
+            choice = self._ask_overwrite_loaded()
+            if choice is None:
+                return
+            if choice:
+                self.session_dir = self.loaded_dir
 
         try:
             directory = self._ensure_session_dir()
         except OSError as e:
             QMessageBox.critical(self, "Error", f"Could not create the output folder:\n{e}")
             return
-        points_path, bboxes_path = self._csv_paths(directory)
+        points_path, bboxes_path, actions_path = self._csv_paths(directory)
+        participants_path = self._participants_path(directory)
 
+        legacy_note = ""
         try:
-            with open(points_path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(["video_name", "frame", "time_sec", "class_name", "x", "y"])
-                for ann in sorted(self.points, key=lambda a: a["frame"]):
-                    writer.writerow([self.video_name, ann["frame"], f"{ann['time_sec']:.3f}",
-                                     ann["class_name"], ann["x"], ann["y"]])
-
             with open(bboxes_path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
                 writer.writerow(["video_name", "frame", "time_sec", "class_name",
@@ -1308,17 +1877,88 @@ class VideoAnnotator(QWidget):
                     writer.writerow([self.video_name, ann["frame"], f"{ann['time_sec']:.3f}",
                                      ann["class_name"], ann["x"], ann["y"],
                                      ann["width"], ann["height"]])
+
+            # action_id numbers the actions in time order and links each one
+            # to its individuals in the participants file
+            ordered = sorted(self.actions, key=lambda a: a["start_frame"])
+            with open(actions_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(self.ACTION_COLUMNS)
+                for action_id, ann in enumerate(ordered, 1):
+                    start, end = ann["start_frame"], ann["end_frame"]
+                    duration = "" if end is None else f"{(end - start) / self.fps:.3f}"
+                    end_box = list(ann["end_box"]) if ann["end_box"] else ["", "", "", ""]
+                    writer.writerow([action_id, self.video_name, ann["action"],
+                                     CLASS_SEPARATOR.join(p["species"] for p in ann["participants"]),
+                                     len(ann["participants"]),
+                                     *self._frame_columns(start), *self._frame_columns(end),
+                                     duration, *ann["start_box"], *end_box])
+
+            with open(participants_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(self.PARTICIPANT_COLUMNS)
+                for action_id, ann in enumerate(ordered, 1):
+                    for number, participant in enumerate(ann["participants"], 1):
+                        join, leave = self._participant_span(ann, participant)
+                        writer.writerow([action_id, self.video_name, ann["action"], number,
+                                         participant["species"],
+                                         *self._frame_columns(join), *self._frame_columns(leave)])
+
+            # Overwriting a folder that held an old points file: its points
+            # are now actions in the file above, so it must not be read again.
+            if os.path.exists(points_path):
+                stem = os.path.splitext(self.video_name)[0]
+                legacy_path = os.path.join(directory, f"{stem}_points_converted.csv")
+                os.replace(points_path, legacy_path)
+                legacy_note = (f"\n\nThe old {os.path.basename(points_path)} is now in the "
+                               f"actions file; it was renamed {os.path.basename(legacy_path)}.")
         except OSError as e:
             QMessageBox.critical(self, "Error", f"Could not write the CSV files:\n{e}")
             return
 
         self.dirty = False
+        open_count = sum(1 for a in self.actions if a["end_frame"] is None)
+        untyped = sum(1 for a in self.actions if not a["action"])
+        notes = ""
+        if open_count:
+            notes += f"\n\n{open_count} action(s) still have no end — saved with empty end columns."
+        if untyped:
+            notes += f"\n{untyped} action(s) still have no type — saved with an empty action column."
         QMessageBox.information(
             self, "Saved",
-            f"{len(self.points)} points → {os.path.basename(points_path)}\n"
-            f"{len(self.bboxes)} bboxes → {os.path.basename(bboxes_path)}\n\n"
-            f"Folder: {directory}")
+            f"{len(self.bboxes)} apparitions → {os.path.basename(bboxes_path)}\n"
+            f"{len(self.actions)} actions → {os.path.basename(actions_path)}\n"
+            f"their individuals → {os.path.basename(participants_path)}\n\n"
+            f"Folder: {directory}{notes}{legacy_note}")
         self.hint_label.setText(f"Saved to {os.path.basename(directory)}/")
+
+    def _ask_overwrite_loaded(self):
+        """First save after Load CSVs: overwrite those files or keep them?
+
+        True => overwrite, False => new session folder, None => cancel. Asked
+        once; later saves go wherever the first one went.
+        """
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Save CSVs")
+        text = (f"These annotations were loaded from:\n{self.loaded_dir}\n\n"
+                f"Overwrite those CSV files, or save to a new session folder "
+                f"and leave them untouched?")
+        if self.loaded_skipped:
+            text += (f"\n\nWarning: those files also hold {self.loaded_skipped} row(s) "
+                     f"of other videos, which overwriting will remove.")
+        box.setText(text)
+        overwrite = box.addButton("Overwrite loaded CSVs", QMessageBox.ButtonRole.DestructiveRole)
+        new_folder = box.addButton("Save to new folder", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(new_folder)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked == overwrite:
+            return True
+        if clicked == new_folder:
+            return False
+        return None
 
     def load_csvs(self):
         """Reload previously saved CSVs so a long video can be resumed."""
@@ -1327,79 +1967,157 @@ class VideoAnnotator(QWidget):
         if self.dirty and not self._confirm_discard("Loading CSVs"):
             return
 
+        # Start in the video's folder: the CSVs worth reviewing usually travel
+        # with the video (often made by someone else), not in our own output.
+        start_dir = os.path.dirname(self.video_path or "") or self._annotations_root()
         directory = QFileDialog.getExistingDirectory(
-            self, "Folder containing the CSVs", self._annotations_root())
+            self, "Folder containing the CSVs", start_dir)
         if not directory:
             return
 
-        points_path, bboxes_path = self._csv_paths(directory)
-        if not os.path.exists(points_path) and not os.path.exists(bboxes_path):
+        paths = self._csv_paths(directory)
+        if not any(os.path.exists(path) for path in paths):
             # The user probably picked the annotations root instead of one
             # session folder — fall back to this video's most recent session.
             latest = self._latest_session_dir(directory)
             if latest is not None:
                 directory = latest
-                points_path, bboxes_path = self._csv_paths(directory)
+                paths = self._csv_paths(directory)
 
-        if not os.path.exists(points_path) and not os.path.exists(bboxes_path):
+        if not any(os.path.exists(path) for path in paths):
             stem = os.path.splitext(self.video_name)[0]
             QMessageBox.warning(
                 self, "Not found",
-                f"No {stem}_points.csv or {stem}_bboxes.csv in:\n{directory}")
+                f"No {stem}_points.csv, {stem}_bboxes.csv or {stem}_actions.csv in:\n{directory}")
             return
+        points_path, bboxes_path, actions_path = paths
+        participants_path = self._participants_path(directory)
 
-        points, bboxes, skipped = [], [], 0
+        bboxes, actions, skipped, converted = [], [], 0, 0
+
+        def rows(path):
+            nonlocal skipped
+            if not os.path.exists(path):
+                return
+            with open(path, newline="", encoding="utf-8") as f:
+                for row in csv.DictReader(f):
+                    if row.get("video_name") and row["video_name"] != self.video_name:
+                        skipped += 1
+                        continue
+                    yield row
+
         try:
-            if os.path.exists(points_path):
-                with open(points_path, newline="", encoding="utf-8") as f:
-                    for row in csv.DictReader(f):
-                        if row.get("video_name") and row["video_name"] != self.video_name:
-                            skipped += 1
-                            continue
-                        points.append({
-                            "frame": int(row["frame"]),
-                            "time_sec": float(row["time_sec"]),
-                            "class_name": row["class_name"],
-                            "x": int(float(row["x"])),
-                            "y": int(float(row["y"])),
-                        })
-            if os.path.exists(bboxes_path):
-                with open(bboxes_path, newline="", encoding="utf-8") as f:
-                    for row in csv.DictReader(f):
-                        if row.get("video_name") and row["video_name"] != self.video_name:
-                            skipped += 1
-                            continue
-                        bboxes.append({
-                            "frame": int(row["frame"]),
-                            "time_sec": float(row["time_sec"]),
-                            "class_name": row["class_name"],
-                            "x": int(float(row["x"])),
-                            "y": int(float(row["y"])),
-                            "width": int(float(row["width"])),
-                            "height": int(float(row["height"])),
-                        })
-        except (OSError, KeyError, ValueError) as e:
+            for row in rows(bboxes_path):
+                bboxes.append({
+                    "frame": int(row["frame"]),
+                    "time_sec": float(row["time_sec"]),
+                    "class_name": row["class_name"],
+                    "x": int(float(row["x"])),
+                    "y": int(float(row["y"])),
+                    "width": int(float(row["width"])),
+                    "height": int(float(row["height"])),
+                })
+            individuals = {}
+            for row in rows(participants_path):
+                individuals.setdefault(row["action_id"].strip(), []).append(row)
+            for row in rows(actions_path):
+                # Files from before end boxes existed have x,y,width,height
+                start_box = (self._read_box(row, "start_")
+                             or self._read_box(row, ""))
+                ann = {
+                    "action": row["action"].strip(),
+                    "start_frame": int(row["start_frame"]),
+                    "start_box": start_box,
+                    "end_frame": self._read_int(row, "end_frame"),
+                    "end_box": self._read_box(row, "end_"),
+                }
+                listed = individuals.get((row.get("action_id") or "").strip())
+                if listed:
+                    listed.sort(key=lambda r: int(r["individual"]))
+                    ann["participants"] = [self._read_participant(ann, r) for r in listed]
+                else:
+                    # No participants file (older files): each species in
+                    # `classes` is one individual present the whole time
+                    ann["participants"] = self._new_participants(
+                        [c.strip() for c in row["classes"].split(CLASS_SEPARATOR) if c.strip()])
+                actions.append(ann)
+            for row in rows(points_path):
+                actions.append(self._point_to_action(row))
+                converted += 1
+        except (OSError, KeyError, ValueError, TypeError) as e:
             QMessageBox.critical(self, "Error", f"Could not read the CSV files:\n{e}")
             return
 
-        self.points = points
         self.bboxes = bboxes
+        self.actions = actions
         self.history = []
+        # Indices are about to change under a tool waiting for a box
+        self.set_tool(None)
         self.classes = []
-        for ann in self.points + self.bboxes:
+        for ann in self.bboxes:
             self._register_class(ann["class_name"])
-        # Resumed work saves into a fresh session folder — the one we just read
-        # from stays untouched as a backup.
+        for ann in self.actions:
+            for participant in ann["participants"]:
+                self._register_class(participant["species"])
+        # The first save asks whether to overwrite the folder we just read
+        # from or to start a fresh session folder (see save_csvs).
         self.session_dir = None
+        self.loaded_dir = directory
+        self.loaded_skipped = skipped
         self.dirty = False
         self.refresh_annotation_list()
         self.show_frame()
 
-        message = f"Loaded {len(points)} points and {len(bboxes)} bboxes."
+        message = f"Loaded {len(bboxes)} apparitions and {len(actions)} actions."
+        if converted:
+            message += (f"\n{converted} of the actions come from old points: they have no "
+                        f"type yet and a small box around the point. Right-click → Edit "
+                        f"action to set the type; S / E to redraw the start / end box.")
         if skipped:
             message += f"\n{skipped} row(s) skipped (they belong to another video)."
         QMessageBox.information(self, "Loaded", message)
         self.hint_label.setText(message.splitlines()[0])
+
+    def _point_to_action(self, row):
+        """An old point (species + frame) as an action with no type yet and a
+        small box centred on the point."""
+        frame_h, frame_w = (self.current_frame.shape[:2] if self.current_frame is not None
+                            else (1080, 1920))
+        side = max(16, int(round(CONVERTED_POINT_BOX * min(frame_w, frame_h))))
+        px, py = int(float(row["x"])), int(float(row["y"]))
+        x = min(max(0, px - side // 2), max(0, frame_w - side))
+        y = min(max(0, py - side // 2), max(0, frame_h - side))
+        return {
+            "action": "",
+            "participants": self._new_participants([row["class_name"].strip()]),
+            "start_frame": int(row["frame"]),
+            "start_box": (x, y, side, side),
+            # Points saved by the previous version may carry an end frame
+            "end_frame": self._read_int(row, "end_frame"),
+            "end_box": None,
+        }
+
+    def _read_participant(self, ann, row):
+        """An individual; a join / leave equal to the action's own start / end
+        is stored as None so it keeps following them."""
+        join = self._read_int(row, "join_frame")
+        leave = self._read_int(row, "leave_frame")
+        return {
+            "species": row["class_name"].strip(),
+            "join": None if join in (None, ann["start_frame"]) else join,
+            "leave": None if leave in (None, ann["end_frame"]) else leave,
+        }
+
+    @staticmethod
+    def _read_int(row, column):
+        value = (row.get(column) or "").strip()
+        return int(float(value)) if value else None
+
+    @classmethod
+    def _read_box(cls, row, prefix):
+        """(x, y, width, height) from `<prefix>x` ... columns, None if empty."""
+        values = [cls._read_int(row, prefix + name) for name in ("x", "y", "width", "height")]
+        return None if None in values else tuple(values)
 
     def _latest_session_dir(self, root):
         """Most recent session folder under `root` holding this video's CSVs."""
@@ -1413,8 +2131,7 @@ class VideoAnnotator(QWidget):
             path = os.path.join(root, name)
             if not os.path.isdir(path) or not name.startswith(f"{stem}_"):
                 continue
-            points_path, bboxes_path = self._csv_paths(path)
-            if os.path.exists(points_path) or os.path.exists(bboxes_path):
+            if any(os.path.exists(p) for p in self._csv_paths(path)):
                 candidates.append(path)
         if not candidates:
             return None
