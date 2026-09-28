@@ -66,24 +66,35 @@ An action is an interval of one of these types, each with its colour:
 2. Pick the **type** and the **species** doing it. For an interaction, set how
    many **individuals** take part and the species of each one. Every species
    box lists the species used so far; typing a new name adds it.
-3. The button now reads **End action…**. Play or skip to the frame where the
-   action **ends** and click two corners around where it ends — the animals may
-   well have moved. That closes the action.
+3. The action is now **in progress**: it appears in the **In progress** panel
+   (bottom right), selected, and the button under the panel reads **End …** in
+   its type's colour (e.g. a red **End Interaction**). Play or skip to the frame
+   where the action **ends** and press it: the action ends on that frame.
+4. The app then asks for the **end box**: click two corners around where the
+   action ends — the animals may well have moved. To leave it without an end
+   box, press `Esc` (or the Action button, now **Skip end box**).
 
 Between the two ends a dashed guide box slides from the start box to the end
 box, and a banner at the top of the frame lists the actions in progress.
 
-`Esc` before drawing the end box leaves the action *open* (`OPEN` in the list).
-To finish or correct an action later, select it in the list and press `Enter`
-to jump to it, then:
+**Several actions at once.** **Action** always starts a new action, whatever is
+already in progress — say, a crab foraging while two others fight. The **In
+progress** panel lists them all, newest first, with their colour, species and
+start time. Click the one to end and press **End …** (it takes that action's
+colour), or double-click it; the others keep running. Selecting an action in
+either list selects it in the other too.
 
-* on its real first frame press `S` and draw the start box again;
-* on its last frame press `E` and draw the end box.
+`E` does the same as **End …** for the action selected. Right-click → **End it
+on this frame** works on any action, including old points converted to
+actions, which have no type and are not listed as in progress.
 
-`Ctrl+Z` undoes either. Right-clicking an action offers the same, plus editing
-its type / species and jumping to its start or end (`Enter` / `Shift`+`Enter` on
-the list row do the same). An open action is drawn past its start frame only
-while it is selected, so many open actions do not clutter every later frame.
+To correct an action later, select it in the list and press `Enter` to jump to
+it, then press `S` on its real first frame (and draw the start box again) or
+`E` on its real last frame. `Ctrl+Z` undoes either. Right-clicking an action
+offers the same, plus editing its type / species and jumping to its start or end
+(`Enter` / `Shift`+`Enter` on the list row do the same). Old points converted to
+actions (no type yet) are drawn past their start only while selected, so they do
+not clutter every later frame.
 
 **Individuals joining or leaving an interaction.** Go to the frame where it
 happens, right-click the interaction (in the list, or its box on the frame) and
@@ -123,8 +134,10 @@ then overwrite that folder, the points file is renamed
 | **🔊 / 🔇** | Mute or unmute the video sound (`M`) |
 | Speed box | 0.25× to 4× playback speed (sound follows) |
 | **Apparition** | Box an animal on this frame (two clicks) |
-| **Action** → **End action…** | Box where an action starts; then box where it ends, on its last frame |
-| `S` / `E` | Redraw the start / end box of the selected action on the current frame |
+| **Action** | Start an action: box where it starts, then its type and species |
+| **In progress** panel | Actions not ended yet; click one, then **End …** (its colour) — or double-click it — to end it on the current frame |
+| `E` | End an action on the current frame: the selected one, the only one in progress, or pick from a menu |
+| `S` | Redraw the start box of the selected action on the current frame |
 | `Esc` | Disarm the tool / cancel a half-drawn box (an action waiting for its end stays open) |
 | `Ctrl+Z` | Undo the last annotation or redrawn start / end |
 | `Del` | Delete the annotation selected in the list |

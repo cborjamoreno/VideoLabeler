@@ -50,7 +50,7 @@ from PyQt6.QtWidgets import (
     QStyleOptionSlider
 )
 from PyQt6.QtGui import (QPixmap, QImage, QGuiApplication, QShortcut, QKeySequence,
-                         QRegularExpressionValidator)
+                         QRegularExpressionValidator, QCursor)
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QUrl, QRegularExpression
 
 from app_modules import LabelDialog, ActionDialog, color_icon
@@ -320,8 +320,9 @@ class VideoAnnotator(QWidget):
         # action's own start / end, so they follow when those are redrawn.
         self.actions = []
         self.classes = []              # ordered class names seen so far
-        # (action index, "start" | "end"): the box the armed Action tool draws
-        # next. Set right after an action is created (its end) and by S / E.
+        # (action index, "endbox" | "start"): what the armed Action tool is
+        # drawing for an existing action — the end box of one just ended, or a
+        # redrawn start box (S).
         self.target = None
         # For Ctrl+Z: ("add", kind, index) for an added annotation and
         # ("endpoint", "action", index, which, previous_frame, previous_box)
@@ -439,8 +440,9 @@ class VideoAnnotator(QWidget):
         self.annotation_list.itemDoubleClicked.connect(self.on_annotation_activated)
         self.annotation_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.annotation_list.customContextMenuRequested.connect(self.on_list_context_menu)
-        # An open action is drawn as in progress only while selected
-        self.annotation_list.currentItemChanged.connect(lambda *_: self.show_frame())
+        # An open action is drawn as in progress only while selected; an action
+        # in progress picked here is also picked in the "In progress" panel
+        self.annotation_list.currentItemChanged.connect(self.on_annotation_selected)
         self.list_filter_combo = QComboBox(self)
         for label, kinds in LIST_FILTERS:
             self.list_filter_combo.addItem(label, kinds)
@@ -448,6 +450,24 @@ class VideoAnnotator(QWidget):
         # Keeps the Up/Down keys for the list itself
         self.list_filter_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.delete_button = self._make_button("Delete selected", "delete-button", self.delete_selected_annotation, width=150)
+
+        # Actions in progress: pick one and end it on the current frame
+        self.open_label = QLabel("In progress")
+        self.open_list = QListWidget(self)
+        self.open_list.setMinimumWidth(280)
+        self.open_list.setMaximumWidth(460)
+        # Mouse only: the arrow keys stay with the video / the list above
+        self.open_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.open_list.currentItemChanged.connect(self.on_open_action_selected)
+        self.open_list.itemDoubleClicked.connect(
+            lambda item: self.end_action_here(item.data(Qt.ItemDataRole.UserRole)))
+        self.open_list.setToolTip("Select an action, then press End (or E) on its last frame.\n"
+                                  "Double-click: end it on the current frame.")
+        self.end_open_button = QPushButton("End action", self)
+        self.end_open_button.setFixedHeight(40)
+        self.end_open_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.end_open_button.clicked.connect(self.end_selected_open_action)
+        self.end_open_button.setEnabled(False)
 
         # ---------------- layout ----------------
         top_layout = QHBoxLayout()
@@ -489,8 +509,12 @@ class VideoAnnotator(QWidget):
         side_layout = QVBoxLayout()
         side_layout.addWidget(QLabel("Annotations (Enter / double-click to jump)"))
         side_layout.addWidget(self.list_filter_combo)
-        side_layout.addWidget(self.annotation_list, 1)
+        side_layout.addWidget(self.annotation_list, 3)
         side_layout.addWidget(self.delete_button)
+        side_layout.addSpacing(10)
+        side_layout.addWidget(self.open_label)
+        side_layout.addWidget(self.open_list, 1)
+        side_layout.addWidget(self.end_open_button)
 
         center_layout = QHBoxLayout()
         center_layout.addWidget(frame_container, 1)
@@ -991,15 +1015,15 @@ class VideoAnnotator(QWidget):
     def _shown_on_frame(self, index, ann):
         """Is this action drawn on the current frame?
 
-        A closed one shows over its whole interval. An open one would otherwise
-        cover every later frame — and old points load as open actions — so it
-        shows past its start only while it is being worked on: waiting for its
-        end box, or selected in the list.
+        A closed one shows over its whole interval, an open one (in progress)
+        from its start onwards. Except open actions with no type — old points
+        converted on load, possibly dozens — which would clutter every later
+        frame: those show past their start only while selected in the list.
         """
         start, end = ann["start_frame"], ann["end_frame"]
         worked_on = (self.target is not None and self.target[0] == index) or \
             self._selected_annotation() == ("action", index)
-        if end is None and not worked_on:
+        if end is None and not ann["action"] and not worked_on:
             end = start
         return self._interval_active(start, end, self.frame_idx)
 
@@ -1200,7 +1224,7 @@ class VideoAnnotator(QWidget):
     def _refresh_tool_buttons(self):
         which = self.target[1] if self.target else None
         self.action_button.setText(
-            {"end": "End action…", "start": "Start box…"}.get(which, "Action"))
+            {"endbox": "Skip end box", "start": "Cancel"}.get(which, "Action"))
         self._set_button_class(
             self.bbox_button,
             "bbox-button-active" if self.tool == "bbox" else "bbox-button-idle")
@@ -1224,16 +1248,22 @@ class VideoAnnotator(QWidget):
             return
         target = self.target
         self.set_tool(None)
-        if target is not None and target[0] < len(self.actions) \
-                and self.actions[target[0]]["end_frame"] is None:
+        if target is None or target[0] >= len(self.actions):
+            return
+        ann = self.actions[target[0]]
+        if target[1] == "endbox":
             self.hint_label.setText(
-                "Left open — select it and press E on its last frame to draw the end box")
+                f"{self._action_label(ann)} ended at frame {ann['end_frame']} (no end box drawn)")
+        elif target[1] == "start":
+            self.hint_label.setText("Start box unchanged")
 
     def toggle_bbox_tool(self):
         self.set_tool(None if self.tool == "bbox" else "bbox")
 
     def toggle_action_tool(self):
-        # While it waits for a box, pressing it again is the same as Esc
+        """Starts a new action — always, even with others in progress; those
+        are ended with their own "End …" buttons. While the tool is drawing
+        an end / start box, pressing it again skips / cancels that box."""
         if self.tool == "action":
             self._on_escape()
         else:
@@ -1263,10 +1293,10 @@ class VideoAnnotator(QWidget):
         self.target = (index, which)
         self._refresh_tool_buttons()
         ann = self.actions[index]
-        if which == "end":
+        if which == "endbox":
             self.hint_label.setText(
-                f"{self._action_label(ann)} — on its LAST frame, click two corners "
-                f"around where it ends (Esc: leave it open)")
+                f"{self._action_label(ann)} ended at frame {ann['end_frame']} — click two "
+                f"corners around where it ends (Esc: no end box)")
         else:
             self.hint_label.setText(
                 f"{self._action_label(ann)} — on its FIRST frame, click two corners "
@@ -1305,7 +1335,10 @@ class VideoAnnotator(QWidget):
                 self.show_frame()
                 return
             self.add_action(box, *details)
-            self._arm_endpoint(len(self.actions) - 1, "end")
+            self.set_tool(None)
+            self.hint_label.setText(
+                f"{self._action_label(self.actions[-1])} in progress — on its last frame "
+                f"press End under 'In progress' (or E)")
             return
 
         class_name = self.ask_class_name()
@@ -1405,6 +1438,8 @@ class VideoAnnotator(QWidget):
         """Put the start or end of an action on the current frame, with `box`."""
         if index >= len(self.actions):
             return False
+        if which == "endbox":
+            which = "end"
         ann = self.actions[index]
         frame = self.frame_idx
         if which == "end" and frame < ann["start_frame"]:
@@ -1468,9 +1503,48 @@ class VideoAnnotator(QWidget):
         self.hint_label.setText(
             f"{participant['species']} leaves at frame {frame} — {self._action_label(ann, frame)}")
 
-    def _endpoint_with_key(self, which):
-        """S / E: redraw the start / end box of the selected action (or of the
-        action the tool is already waiting for) on the current frame."""
+    def end_action_here(self, index):
+        """End an action on the current frame, then ask for its end box."""
+        ann = self.actions[index]
+        if self.frame_idx < ann["start_frame"]:
+            self.hint_label.setText(
+                f"{self._action_label(ann)} starts at frame {ann['start_frame']} — "
+                f"go to a later frame to end it")
+            return
+        self.pause()
+        self.history.append(("endpoint", "action", index, "end",
+                             ann["end_frame"], ann["end_box"]))
+        ann["end_frame"] = self.frame_idx
+        self.dirty = True
+        self.refresh_annotation_list(select=("action", index))
+        self._arm_endpoint(index, "endbox")
+
+    def _pick_action_to_end(self):
+        """The action E should end: the one selected in the list; otherwise
+        the only one in progress; with several in progress, ask which."""
+        selected = self._selected_annotation()
+        if selected is not None and selected[0] == "action":
+            return selected[1]
+        in_progress = [i for i, a in enumerate(self.actions)
+                       if a["end_frame"] is None and a["start_frame"] <= self.frame_idx]
+        if not in_progress:
+            self.hint_label.setText("No action in progress here — select one in the list")
+            return None
+        if len(in_progress) == 1:
+            return in_progress[0]
+        menu = QMenu(self)
+        menu.addSection("End which action?")
+        for i in sorted(in_progress, key=lambda i: -self.actions[i]["start_frame"]):
+            ann = self.actions[i]
+            since = format_time(ann["start_frame"] / self.fps, millis=False)
+            item = menu.addAction(color_icon(self.action_color(ann["action"])),
+                                  f"{self._action_label(ann)}   (since {since})")
+            item.setData(i)
+        chosen = menu.exec(QCursor.pos())
+        return None if chosen is None else chosen.data()
+
+    def start_with_key(self):
+        """S: redraw the start box of the selected action on the current frame."""
         if self.cap is None:
             return
         if self.target is not None:
@@ -1481,13 +1555,16 @@ class VideoAnnotator(QWidget):
                 self.hint_label.setText("Select an action in the list first")
                 return
             index = selected[1]
-        self._arm_endpoint(index, which)
-
-    def start_with_key(self):
-        self._endpoint_with_key("start")
+        self._arm_endpoint(index, "start")
 
     def end_with_key(self):
-        self._endpoint_with_key("end")
+        """E: end an action on the current frame — the one the tool is working
+        on, else the selected one, else the one (or a chosen one) in progress."""
+        if self.cap is None:
+            return
+        index = self.target[0] if self.target is not None else self._pick_action_to_end()
+        if index is not None:
+            self.end_action_here(index)
 
     def undo_last(self):
         """Remove the most recently added annotation (or redrawn start / end)."""
@@ -1616,6 +1693,105 @@ class VideoAnnotator(QWidget):
             if (kind, index) == select:
                 self.annotation_list.setCurrentItem(item)
         self.annotation_list.blockSignals(False)
+        self._refresh_in_progress()
+
+    # ------------------------------------------------------------------
+    # actions in progress panel
+    # ------------------------------------------------------------------
+    def _refresh_in_progress(self):
+        """Fill the "In progress" panel: every open action, newest first.
+
+        Old points converted to actions (no type yet) are open too but are not
+        in progress in any real sense, and may be dozens — they are left out
+        (E or right-click still ends them). Selects the action selected in the
+        list above if it is in progress (a new action is), else keeps the row
+        selected before, else the newest."""
+        selected = self._selected_annotation()
+        previous = (selected[1] if selected is not None and selected[0] == "action"
+                    and selected[1] < len(self.actions)
+                    and self.actions[selected[1]]["end_frame"] is None
+                    else self._selected_open_action())
+        in_progress = sorted(
+            ((i, a) for i, a in enumerate(self.actions) if a["end_frame"] is None and a["action"]),
+            key=lambda e: -e[1]["start_frame"])
+
+        self.open_list.blockSignals(True)
+        self.open_list.clear()
+        for index, ann in in_progress:
+            species = self._species_text([p["species"] for p in ann["participants"]])
+            since = format_time(ann["start_frame"] / self.fps, millis=False)
+            item = QListWidgetItem(color_icon(self.action_color(ann["action"])),
+                                   f"{ann['action']}  ·  {species}  ·  since {since}")
+            item.setData(Qt.ItemDataRole.UserRole, index)
+            item.setToolTip(f"Started at frame {ann['start_frame']}")
+            self.open_list.addItem(item)
+            if index == previous:
+                self.open_list.setCurrentItem(item)
+        if self.open_list.currentItem() is None and self.open_list.count():
+            self.open_list.setCurrentRow(0)
+        self.open_list.blockSignals(False)
+
+        self.open_label.setText(f"In progress ({len(in_progress)})" if in_progress
+                                else "In progress — none")
+        self._style_end_open_button()
+
+    def _selected_open_action(self):
+        item = self.open_list.currentItem()
+        return None if item is None else item.data(Qt.ItemDataRole.UserRole)
+
+    def _style_end_open_button(self):
+        """The End button takes the colour of the action it would end."""
+        index = self._selected_open_action()
+        if index is None or index >= len(self.actions):
+            self.end_open_button.setText("End action")
+            self.end_open_button.setEnabled(False)
+            self.end_open_button.setStyleSheet("")
+            return
+        ann = self.actions[index]
+        r, g, b = self.action_color(ann["action"])
+        text_color = "black" if 0.299 * r + 0.587 * g + 0.114 * b > 150 else "white"
+        self.end_open_button.setText(f"End {ann['action']}")
+        self.end_open_button.setEnabled(self.cap is not None)
+        self.end_open_button.setStyleSheet(
+            f"QPushButton {{ background-color: rgb({r}, {g}, {b}); color: {text_color};"
+            f" border: 2px solid rgb({r // 2}, {g // 2}, {b // 2}); border-radius: 4px;"
+            f" padding: 4px 12px; font-weight: bold; }}"
+            f"QPushButton:hover {{ border: 2px solid black; }}")
+
+    def on_open_action_selected(self, *_):
+        """Picking an action in progress also selects it in the list above, so
+        E and the frame overlay follow it."""
+        self._style_end_open_button()
+        index = self._selected_open_action()
+        if index is None:
+            return
+        for row in range(self.annotation_list.count()):
+            item = self.annotation_list.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) == ("action", index):
+                self.annotation_list.blockSignals(True)
+                self.annotation_list.setCurrentItem(item)
+                self.annotation_list.blockSignals(False)
+                self.annotation_list.scrollToItem(item)
+                break
+        self.show_frame()
+
+    def on_annotation_selected(self, *_):
+        """Keep the "In progress" panel on the same action as the list."""
+        selected = self._selected_annotation()
+        if selected is not None and selected[0] == "action":
+            for row in range(self.open_list.count()):
+                if self.open_list.item(row).data(Qt.ItemDataRole.UserRole) == selected[1]:
+                    self.open_list.blockSignals(True)
+                    self.open_list.setCurrentRow(row)
+                    self.open_list.blockSignals(False)
+                    self._style_end_open_button()
+                    break
+        self.show_frame()
+
+    def end_selected_open_action(self):
+        index = self._selected_open_action()
+        if index is not None:
+            self.end_action_here(index)
 
     def _selected_annotation(self):
         item = self.annotation_list.currentItem()
@@ -1736,7 +1912,7 @@ class VideoAnnotator(QWidget):
             menu.addSeparator()
         if kind == "action":
             start_here = menu.addAction(f"Redraw start box on this frame ({self.frame_idx})  S")
-            end_here = menu.addAction(f"Redraw end box on this frame ({self.frame_idx})  E")
+            end_here = menu.addAction(f"End it on this frame ({self.frame_idx})  E")
             start_jump = menu.addAction("Jump to start")
             end_jump = menu.addAction("Jump to end")
             end_jump.setEnabled(self.actions[index]["end_frame"] is not None)
@@ -1755,7 +1931,7 @@ class VideoAnnotator(QWidget):
         elif action == start_here:
             self._arm_endpoint(index, "start")
         elif action == end_here:
-            self._arm_endpoint(index, "end")
+            self.end_action_here(index)
         elif action == start_jump:
             self.jump_to_annotation(kind, index)
         elif action == end_jump:

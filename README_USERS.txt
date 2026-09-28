@@ -66,9 +66,14 @@ HOW TO USE IT
                     say how many and the species of each one)
       Passing, Shelter use, Foraging, Presence,
       Approach (moving in on the bait), Consume (eating it)  (one species)
-   and tick the species. The button now reads "End action...": go to the
-   frame where the action ENDS and click two corners around where it ends
-   (the animals may have moved). Done.
+   and the species. The action appears in the "In progress" panel (bottom
+   right) and the button under it reads "End ..." in that action's colour:
+   go to the frame where the action ENDS and press it. Then click two
+   corners around where it ends (the animals may have moved). Done.
+
+   Several actions at the same time: just press "Action" again to start
+   another one. To end one, click it in the "In progress" panel and press
+   "End ..." (or double-click it); the others keep running.
 
    If an animal joins or leaves an interaction while it lasts: go to that
    frame, right-click the interaction and choose "Individual joins..." or
@@ -76,7 +81,7 @@ HOW TO USE IT
 
    To fix an action later: select it in the list, press Enter to go to it,
    then S on its real first frame (draw the start box again) or E on its
-   last frame (draw the end box again).
+   real last frame.
 
 7. Old files with points: each point becomes an action with no type yet
    ("?" in the list) and a small box. Right-click it -> "Edit action" to
