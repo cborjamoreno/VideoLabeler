@@ -77,6 +77,25 @@ An action is an interval of one of these types, each with its colour:
 Between the two ends a dashed guide box slides from the start box to the end
 box, and a banner at the top of the frame lists the actions in progress.
 
+**Intermediate boxes.** A straight slide from start to end is a poor guess for a
+long action or a winding path. Go to any frame inside the action where the guide
+box drifts off the animal, select the action (or leave nothing selected if it is
+the only one on the frame) and press `K` — or right-click it → **Add
+intermediate box on this frame** — then click two corners around the animal.
+Add as many as needed: the guide box then slides from each drawn box to the
+next.
+
+Selecting an action in the list opens the **Boxes** panel above **In progress**:
+it lists the action's start box, its intermediate boxes and its end box in time
+order, with their frame, time and coordinates, and reminds you that `K` adds
+one. Clicking a row goes to that frame; the row of the frame on screen is
+highlighted. Its buttons add (or redraw) a box on the current frame and remove
+the intermediate box of the current frame. On a frame that already has one, `K` redraws it and right-click offers
+**Remove intermediate box**. On the action's first / last frame, `K` redraws its
+start / end box instead. `Ctrl+Z` undoes any of these. Intermediate boxes are
+drawn solid, captioned `BOX`; the list row counts them (`+3 boxes`) and its
+tooltip gives their frames.
+
 **Several actions at once.** **Action** always starts a new action, whatever is
 already in progress — say, a crab foraging while two others fight. The **In
 progress** panel lists them all, newest first, with their colour, species and
@@ -138,6 +157,7 @@ then overwrite that folder, the points file is renamed
 | **In progress** panel | Actions not ended yet; click one, then **End …** (its colour) — or double-click it — to end it on the current frame |
 | `E` | End an action on the current frame: the selected one, the only one in progress, or pick from a menu |
 | `S` | Redraw the start box of the selected action on the current frame |
+| `K` | Add (or redraw) an intermediate box of the selected action on the current frame |
 | `Esc` | Disarm the tool / cancel a half-drawn box (an action waiting for its end stays open) |
 | `Ctrl+Z` | Undo the last annotation or redrawn start / end |
 | `Del` | Delete the annotation selected in the list |
@@ -162,11 +182,13 @@ VideoLabeler/
     ├── dive01_20260729_114100/      ← Monday's session
     │   ├── dive01_bboxes.csv
     │   ├── dive01_actions.csv
-    │   └── dive01_participants.csv
+    │   ├── dive01_participants.csv
+    │   └── dive01_keyframes.csv
     └── dive01_20260730_092512/      ← Tuesday's session on the same video
         ├── dive01_bboxes.csv
         ├── dive01_actions.csv
-        └── dive01_participants.csv
+        ├── dive01_participants.csv
+        └── dive01_keyframes.csv
 ```
 
 Saving repeatedly during one session updates the files in that session's folder.
@@ -206,6 +228,14 @@ action_id,video_name,action,individual,class_name,join_frame,join_time_sec,leave
 1,dive01.mp4,Interaction,3,Whelk,540,18.000,620,20.667
 ```
 
+**`<video>_keyframes.csv`** — one row per intermediate box of each action
+
+```
+action_id,video_name,action,frame,time_sec,x,y,width,height
+1,dive01.mp4,Interaction,560,18.667,350,100,175,145
+1,dive01.mp4,Interaction,590,19.667,400,140,170,150
+```
+
 Column meaning:
 
 * `video_name` — file name of the annotated video.
@@ -225,6 +255,9 @@ Column meaning:
 * `start_frame` / `end_frame` and their `_time_sec` — first and last frame of
   the action; `duration_sec` — the interval in seconds.
 * `start_*` / `end_*` — the box on the first / last frame.
+* `frame`, `x` … (keyframes) — an intermediate box of the action and the frame
+  it was drawn on, strictly between its start and end. Between any two drawn
+  boxes the animal is assumed to move linearly.
 
 An open action (its end never marked) leaves every `end_*` column,
 `duration_sec` and the `leave_*` columns of individuals still in it empty. All

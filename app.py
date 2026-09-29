@@ -7,7 +7,8 @@ Two kinds of annotation, both drawn as boxes on a paused frame:
   Shelter use, Foraging, Presence, Approach, Consume), performed by one
   individual (two or more for an interaction, possibly of the same species, and
   able to join or leave while it lasts). It has a box on its first frame and
-  another on its last frame, since the animals may have moved in between.
+  another on its last frame, since the animals may have moved in between, plus
+  as many intermediate boxes as needed where the motion is not a straight line.
 
 Everything is exported to CSV:
 
@@ -19,9 +20,13 @@ Everything is exported to CSV:
     <video>_participants.csv
                          action_id,video_name,action,individual,class_name,
                          join_frame,join_time_sec,leave_frame,leave_time_sec
+    <video>_keyframes.csv
+                         action_id,video_name,action,frame,time_sec,
+                         x,y,width,height
 
 `classes` joins the species of every individual with ';' (repeats included);
-participants.csv has one row per individual with when it joined and left.
+participants.csv has one row per individual with when it joined and left;
+keyframes.csv one row per intermediate box of an action.
 An action whose end was never marked leaves every end_* column, duration_sec
 and the leave columns of individuals still in it empty.
 
@@ -318,16 +323,19 @@ class VideoAnnotator(QWidget):
         # end ones are None until the end is marked. participants: one dict per
         # individual — species, join, leave — where join / leave None mean the
         # action's own start / end, so they follow when those are redrawn.
+        # keyframes: {frame: box} of the intermediate boxes; ones left outside
+        # the interval by a redrawn start / end are ignored, not deleted, so
+        # undoing that redraw brings them back.
         self.actions = []
         self.classes = []              # ordered class names seen so far
-        # (action index, "endbox" | "start"): what the armed Action tool is
-        # drawing for an existing action — the end box of one just ended, or a
-        # redrawn start box (S).
+        # (action index, "endbox" | "start" | "key"): what the armed Action tool
+        # is drawing for an existing action — the end box of one just ended, a
+        # redrawn start box (S) or an intermediate box (K).
         self.target = None
         # For Ctrl+Z: ("add", kind, index) for an added annotation and
         # ("endpoint", "action", index, which, previous_frame, previous_box)
         # for a redrawn start / end, ("snapshot", "action", index, old_copy)
-        # for an individual joining / leaving.
+        # for an individual joining / leaving or an intermediate box.
         self.history = []
         self.session_dir = None        # created on the first save of a session
         # Folder the current annotations were loaded from (None if not loaded)
@@ -430,7 +438,8 @@ class VideoAnnotator(QWidget):
         self.bbox_button.setToolTip("Box an animal on the frame where it appears")
         self.action_button = self._make_button("Action", "action-button-idle", self.toggle_action_tool, width=120)
         self.action_button.setToolTip(
-            "Box where an action starts, then box where it ends on its last frame")
+            "Box where an action starts, then box where it ends on its last frame.\n"
+            "K adds an intermediate box on the current frame for long or winding motions")
         self.hint_label = QLabel("Open a video to start")
 
         # Annotation list panel
@@ -450,6 +459,35 @@ class VideoAnnotator(QWidget):
         # Keeps the Up/Down keys for the list itself
         self.list_filter_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.delete_button = self._make_button("Delete selected", "delete-button", self.delete_selected_annotation, width=150)
+
+        # Boxes of the selected action: its start, intermediate and end boxes.
+        # Shown only while an action is selected in the list above.
+        self.boxes_label = QLabel()
+        self.boxes_label.setWordWrap(True)
+        self.boxes_list = QListWidget(self)
+        self.boxes_list.setMinimumWidth(280)
+        self.boxes_list.setMaximumWidth(460)
+        # Mouse only, like the "In progress" panel
+        self.boxes_list.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.boxes_list.itemClicked.connect(self.on_box_clicked)
+        self.boxes_list.setToolTip("Click a box to go to its frame.\n"
+                                   "The box of the frame on screen is highlighted.")
+        self.add_box_button = self._make_button("Add box here  (K)", "neutral-button",
+                                                self.keyframe_with_key)
+        self.add_box_button.setToolTip("Draw a box of this action on the current frame")
+        self.remove_box_button = self._make_button("Remove box", "delete-button",
+                                                   self.remove_current_keyframe)
+        self.remove_box_button.setToolTip("Remove the intermediate box of the current frame")
+        self.boxes_panel = QWidget(self)
+        boxes_layout = QVBoxLayout(self.boxes_panel)
+        boxes_layout.setContentsMargins(0, 0, 0, 0)
+        boxes_layout.addWidget(self.boxes_label)
+        boxes_layout.addWidget(self.boxes_list, 1)
+        boxes_buttons = QHBoxLayout()
+        boxes_buttons.addWidget(self.add_box_button)
+        boxes_buttons.addWidget(self.remove_box_button)
+        boxes_layout.addLayout(boxes_buttons)
+        self.boxes_panel.setVisible(False)
 
         # Actions in progress: pick one and end it on the current frame
         self.open_label = QLabel("In progress")
@@ -512,6 +550,7 @@ class VideoAnnotator(QWidget):
         side_layout.addWidget(self.annotation_list, 3)
         side_layout.addWidget(self.delete_button)
         side_layout.addSpacing(10)
+        side_layout.addWidget(self.boxes_panel, 2)
         side_layout.addWidget(self.open_label)
         side_layout.addWidget(self.open_list, 1)
         side_layout.addWidget(self.end_open_button)
@@ -591,6 +630,7 @@ class VideoAnnotator(QWidget):
             ("Shift+Enter", lambda: self.jump_to_selected_annotation(to_end=True)),
             ("E", self.end_with_key),
             ("S", self.start_with_key),
+            ("K", self.keyframe_with_key),
             ("Escape", self._on_escape),
         ]
         self._shortcuts = []
@@ -925,6 +965,7 @@ class VideoAnnotator(QWidget):
             self.position_slider.blockSignals(True)
             self.position_slider.setValue(min(self.frame_idx, self.total_frames - 1))
             self.position_slider.blockSignals(False)
+        self._highlight_current_box()
 
     def on_frame_entered(self):
         text = self.frame_edit.text().strip()
@@ -1028,18 +1069,35 @@ class VideoAnnotator(QWidget):
         return self._interval_active(start, end, self.frame_idx)
 
     @staticmethod
-    def _action_box_at(ann, frame):
-        """The action's box on `frame`: its start box, sliding linearly towards
-        its end box across the interval (a guide only — just the two ends are
-        annotated)."""
-        start_box, end_box = ann["start_box"], ann["end_box"]
+    def _action_keyframes(ann):
+        """Intermediate boxes inside the action's interval: [(frame, box)] in
+        time order."""
         start, end = ann["start_frame"], ann["end_frame"]
-        if end_box is None or end is None:
-            return start_box
-        if end <= start:
-            return end_box if frame >= end else start_box
-        t = min(1.0, max(0.0, (frame - start) / (end - start)))
-        return tuple(int(round(a + (b - a) * t)) for a, b in zip(start_box, end_box))
+        return [(f, box) for f, box in sorted(ann["keyframes"].items())
+                if f > start and (end is None or f < end)]
+
+    @classmethod
+    def _action_track(cls, ann):
+        """Every box drawn for the action, [(frame, box)] in time order: start,
+        intermediate ones, end (if its box was drawn)."""
+        track = [(ann["start_frame"], ann["start_box"])] + cls._action_keyframes(ann)
+        if ann["end_frame"] is not None and ann["end_box"] is not None:
+            track.append((ann["end_frame"], ann["end_box"]))
+        return track
+
+    @classmethod
+    def _action_box_at(cls, ann, frame):
+        """The action's box on `frame`: sliding linearly from each drawn box
+        (start, intermediate, end) to the next one — a guide only between
+        them. Past the last drawn box it stays there."""
+        track = cls._action_track(ann)
+        if frame <= track[0][0]:
+            return track[0][1]
+        for (f0, box0), (f1, box1) in zip(track, track[1:]):
+            if frame <= f1 and f1 > f0:
+                t = (frame - f0) / (f1 - f0)
+                return tuple(int(round(a + (b - a) * t)) for a, b in zip(box0, box1))
+        return track[-1][1]
 
     @staticmethod
     def _span_text(start, end):
@@ -1083,8 +1141,9 @@ class VideoAnnotator(QWidget):
                     cv2.line(image, (fixed, start), (fixed, end), color, thickness)
 
     def _draw_actions(self, overlay, thickness):
-        """Solid boxes on an action's first and last frame, a dashed guide box
-        in between. Returns the lines of the in-progress banner."""
+        """Solid boxes on an action's first and last frame and on its
+        intermediate boxes, a dashed guide box in between. Returns the lines
+        of the in-progress banner."""
         banner = []
         for i, ann in enumerate(self.actions):
             if not self._shown_on_frame(i, ann):
@@ -1098,6 +1157,9 @@ class VideoAnnotator(QWidget):
             elif self.frame_idx == ann["end_frame"]:
                 cv2.rectangle(overlay, (x, y), (x + w, y + h), color, thickness * 2)
                 self._draw_caption(overlay, f"END {label}", (x, y - thickness), color)
+            elif self.frame_idx in dict(self._action_keyframes(ann)):
+                cv2.rectangle(overlay, (x, y), (x + w, y + h), color, thickness * 2)
+                self._draw_caption(overlay, f"BOX {label}", (x, y - thickness), color)
             else:
                 self._draw_dashed_rect(overlay, (x, y), (x + w, y + h), color,
                                        max(1, thickness // 2))
@@ -1224,7 +1286,7 @@ class VideoAnnotator(QWidget):
     def _refresh_tool_buttons(self):
         which = self.target[1] if self.target else None
         self.action_button.setText(
-            {"endbox": "Skip end box", "start": "Cancel"}.get(which, "Action"))
+            {"endbox": "Skip end box", "start": "Cancel", "key": "Cancel"}.get(which, "Action"))
         self._set_button_class(
             self.bbox_button,
             "bbox-button-active" if self.tool == "bbox" else "bbox-button-idle")
@@ -1256,6 +1318,8 @@ class VideoAnnotator(QWidget):
                 f"{self._action_label(ann)} ended at frame {ann['end_frame']} (no end box drawn)")
         elif target[1] == "start":
             self.hint_label.setText("Start box unchanged")
+        elif target[1] == "key":
+            self.hint_label.setText("No intermediate box added")
 
     def toggle_bbox_tool(self):
         self.set_tool(None if self.tool == "bbox" else "bbox")
@@ -1288,7 +1352,8 @@ class VideoAnnotator(QWidget):
         self.show_frame()
 
     def _arm_endpoint(self, index, which):
-        """Arm the Action tool to draw the start or end box of an action."""
+        """Arm the Action tool to draw the start, end or an intermediate box
+        of an action."""
         self.set_tool("action")
         self.target = (index, which)
         self._refresh_tool_buttons()
@@ -1297,6 +1362,10 @@ class VideoAnnotator(QWidget):
             self.hint_label.setText(
                 f"{self._action_label(ann)} ended at frame {ann['end_frame']} — click two "
                 f"corners around where it ends (Esc: no end box)")
+        elif which == "key":
+            self.hint_label.setText(
+                f"{self._action_label(ann)} — click two corners around where it is on "
+                f"frame {self.frame_idx} (Esc: cancel)")
         else:
             self.hint_label.setText(
                 f"{self._action_label(ann)} — on its FIRST frame, click two corners "
@@ -1327,7 +1396,10 @@ class VideoAnnotator(QWidget):
 
         if self.tool == "action":
             if self.target is not None:
-                self.set_endpoint(*self.target, box)
+                if self.target[1] == "key":
+                    self.set_keyframe(self.target[0], box)
+                else:
+                    self.set_endpoint(*self.target, box)
                 return
             details = self.ask_action_details()
             if details is None:
@@ -1428,6 +1500,7 @@ class VideoAnnotator(QWidget):
             "start_box": tuple(int(v) for v in box),
             "end_frame": None,
             "end_box": None,
+            "keyframes": {},
         })
         self.history.append(("add", "action", len(self.actions) - 1))
         self.dirty = True
@@ -1465,6 +1538,62 @@ class VideoAnnotator(QWidget):
             text += f" ({(ann['end_frame'] - ann['start_frame']) / self.fps:.2f}s)"
         self.hint_label.setText(text)
         return True
+
+    def _keyframe_allowed(self, ann, frame):
+        """Hint text if an intermediate box cannot go on `frame`, else None."""
+        start, end = ann["start_frame"], ann["end_frame"]
+        if frame < start or (end is not None and frame > end):
+            return f"Go to a frame inside the action ({self._span_text(start, end)}) first"
+        return None
+
+    def arm_keyframe(self, index):
+        """Arm the Action tool to draw an intermediate box of an action on
+        the current frame — on its first / last frame, that redraws the
+        start / end box instead."""
+        ann = self.actions[index]
+        problem = self._keyframe_allowed(ann, self.frame_idx)
+        if problem:
+            self.hint_label.setText(problem)
+            return
+        if self.frame_idx == ann["start_frame"]:
+            self._arm_endpoint(index, "start")
+        elif self.frame_idx == ann["end_frame"]:
+            self._arm_endpoint(index, "endbox")
+        else:
+            self._arm_endpoint(index, "key")
+
+    def set_keyframe(self, index, box):
+        """Put an intermediate box of an action on the current frame (it
+        replaces the one already there, if any)."""
+        if index >= len(self.actions):
+            return False
+        ann = self.actions[index]
+        problem = self._keyframe_allowed(ann, self.frame_idx)
+        if problem:
+            self.hint_label.setText(problem)
+            self.show_frame()
+            return False
+        self.history.append(("snapshot", "action", index, copy.deepcopy(ann)))
+        ann["keyframes"][self.frame_idx] = tuple(int(v) for v in box)
+        self.dirty = True
+        self.set_tool(None)
+        self.refresh_annotation_list(select=("action", index))
+        self.show_frame()
+        self.hint_label.setText(
+            f"{self._action_label(ann)} — box on frame {self.frame_idx} "
+            f"({len(self._action_keyframes(ann))} intermediate)")
+        return True
+
+    def remove_keyframe(self, index, frame):
+        ann = self.actions[index]
+        if frame not in ann["keyframes"]:
+            return
+        self.history.append(("snapshot", "action", index, copy.deepcopy(ann)))
+        del ann["keyframes"][frame]
+        self.dirty = True
+        self.refresh_annotation_list(select=("action", index))
+        self.show_frame()
+        self.hint_label.setText(f"{self._action_label(ann)} — box on frame {frame} removed")
 
     def participant_joins(self, index):
         """A new individual joins the action on the current frame."""
@@ -1557,6 +1686,25 @@ class VideoAnnotator(QWidget):
             index = selected[1]
         self._arm_endpoint(index, "start")
 
+    def keyframe_with_key(self):
+        """K: draw an intermediate box on the current frame for the action the
+        tool is working on, else the selected one, else the only one shown."""
+        if self.cap is None:
+            return
+        if self.target is not None:
+            index = self.target[0]
+        else:
+            selected = self._selected_annotation()
+            if selected is not None and selected[0] == "action":
+                index = selected[1]
+            else:
+                shown = [i for i, a in enumerate(self.actions) if self._shown_on_frame(i, a)]
+                if len(shown) != 1:
+                    self.hint_label.setText("Select an action in the list first")
+                    return
+                index = shown[0]
+        self.arm_keyframe(index)
+
     def end_with_key(self):
         """E: end an action on the current frame — the one the tool is working
         on, else the selected one, else the one (or a chosen one) in progress."""
@@ -1648,6 +1796,9 @@ class VideoAnnotator(QWidget):
             when += (f" → {self._list_time_text(ann['end_frame'] / self.fps)}  "
                      f"[{(ann['end_frame'] - start) / self.fps:.2f}s]")
         species = self._species_text([p["species"] for p in ann["participants"]])
+        keys = len(self._action_keyframes(ann))
+        if keys:
+            when += f"  +{keys} box{'es' if keys > 1 else ''}"
         return f"{ann['action'] or '?'}  ·  {species}  ·  {when}"
 
     def _list_entry_tooltip(self, kind, ann):
@@ -1658,6 +1809,9 @@ class VideoAnnotator(QWidget):
         if len(ann["participants"]) > 1:
             for i, p in enumerate(ann["participants"]):
                 tip += f"\n  #{i + 1} {p['species']}  {self._span_text(*self._participant_span(ann, p))}"
+        keys = self._action_keyframes(ann)
+        if keys:
+            tip += "\nIntermediate boxes on frames " + ", ".join(str(f) for f, _box in keys)
         if not ann["action"]:
             tip += "\nNo action type yet: right-click → Edit action"
         if ann["end_frame"] is None:
@@ -1694,6 +1848,7 @@ class VideoAnnotator(QWidget):
                 self.annotation_list.setCurrentItem(item)
         self.annotation_list.blockSignals(False)
         self._refresh_in_progress()
+        self._refresh_boxes_panel()
 
     # ------------------------------------------------------------------
     # actions in progress panel
@@ -1735,6 +1890,87 @@ class VideoAnnotator(QWidget):
                                 else "In progress — none")
         self._style_end_open_button()
 
+    # ------------------------------------------------------------------
+    # boxes panel (the selected action's boxes)
+    # ------------------------------------------------------------------
+    def _boxes_action(self):
+        """Index of the action the boxes panel shows, or None."""
+        selected = self._selected_annotation()
+        if selected is None or selected[0] != "action" or selected[1] >= len(self.actions):
+            return None
+        return selected[1]
+
+    def _refresh_boxes_panel(self):
+        """List the selected action's boxes in time order; hide the panel
+        when no action is selected."""
+        index = self._boxes_action()
+        self.boxes_panel.setVisible(index is not None)
+        if index is None:
+            return
+        ann = self.actions[index]
+        keys = self._action_keyframes(ann)
+        self.boxes_label.setText(
+            f"<b>Boxes of {self._action_label(ann)}</b> ({len(keys)} intermediate)<br>"
+            f"Press <b>K</b> on a frame inside the action to add a box there "
+            f"(or redraw the one already on it).")
+        rows = [("START", ann["start_frame"], ann["start_box"])]
+        rows += [("BOX", frame, box) for frame, box in keys]
+        if ann["end_frame"] is not None:
+            rows.append(("END", ann["end_frame"], ann["end_box"]))
+        color = color_icon(self.action_color(ann["action"]))
+        self.boxes_list.blockSignals(True)
+        self.boxes_list.clear()
+        for number, (which, frame, box) in enumerate(rows):
+            name = f"#{number}" if which == "BOX" else which
+            where = ("no box drawn" if box is None
+                     else f"({box[0]}, {box[1]}) {box[2]}×{box[3]}")
+            item = QListWidgetItem(
+                color, f"{name:<6}  f{frame}  ·  {format_time(frame / self.fps, millis=False)}  ·  {where}")
+            item.setData(Qt.ItemDataRole.UserRole, (which, frame))
+            self.boxes_list.addItem(item)
+        if ann["end_frame"] is None:
+            item = QListWidgetItem("END     not marked yet (E on its last frame)")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.boxes_list.addItem(item)
+        self.boxes_list.blockSignals(False)
+        self._highlight_current_box()
+
+    def _highlight_current_box(self):
+        """Select the box drawn on the frame on screen (none between boxes)
+        and enable the buttons that make sense here."""
+        index = self._boxes_action()
+        if index is None or not self.boxes_panel.isVisible():
+            return
+        ann = self.actions[index]
+        current = None
+        self.boxes_list.blockSignals(True)
+        self.boxes_list.clearSelection()
+        self.boxes_list.setCurrentItem(None)
+        for row in range(self.boxes_list.count()):
+            item = self.boxes_list.item(row)
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if data is not None and data[1] == self.frame_idx:
+                self.boxes_list.setCurrentItem(item)
+                self.boxes_list.scrollToItem(item)
+                current = data[0]
+        self.boxes_list.blockSignals(False)
+        inside = self._keyframe_allowed(ann, self.frame_idx) is None
+        self.add_box_button.setEnabled(self.cap is not None and inside)
+        self.add_box_button.setText("Redraw box here  (K)" if current else "Add box here  (K)")
+        self.remove_box_button.setEnabled(current == "BOX")
+
+    def on_box_clicked(self, item):
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if data is None or self.cap is None:
+            return
+        self.pause()
+        self.seek_to(data[1])
+
+    def remove_current_keyframe(self):
+        index = self._boxes_action()
+        if index is not None:
+            self.remove_keyframe(index, self.frame_idx)
+
     def _selected_open_action(self):
         item = self.open_list.currentItem()
         return None if item is None else item.data(Qt.ItemDataRole.UserRole)
@@ -1773,6 +2009,7 @@ class VideoAnnotator(QWidget):
                 self.annotation_list.blockSignals(False)
                 self.annotation_list.scrollToItem(item)
                 break
+        self._refresh_boxes_panel()
         self.show_frame()
 
     def on_annotation_selected(self, *_):
@@ -1786,6 +2023,7 @@ class VideoAnnotator(QWidget):
                     self.open_list.blockSignals(False)
                     self._style_end_open_button()
                     break
+        self._refresh_boxes_panel()
         self.show_frame()
 
     def end_selected_open_action(self):
@@ -1899,6 +2137,7 @@ class VideoAnnotator(QWidget):
         menu = QMenu(self)
         change_action = menu.addAction("Edit action…" if kind == "action" else "Change class")
         start_here = end_here = start_jump = end_jump = join_here = None
+        key_here = key_remove = None
         leave_actions = {}
         if kind == "action" and self.actions[index]["action"] in MULTI_SPECIES_TYPES:
             ann = self.actions[index]
@@ -1913,6 +2152,20 @@ class VideoAnnotator(QWidget):
         if kind == "action":
             start_here = menu.addAction(f"Redraw start box on this frame ({self.frame_idx})  S")
             end_here = menu.addAction(f"End it on this frame ({self.frame_idx})  E")
+            ann = self.actions[index]
+            menu.addSeparator()
+            if self.frame_idx in dict(self._action_keyframes(ann)):
+                key_here = menu.addAction(
+                    f"Redraw intermediate box on this frame ({self.frame_idx})  K")
+                key_remove = menu.addAction(
+                    f"Remove intermediate box on this frame ({self.frame_idx})")
+            else:
+                key_here = menu.addAction(
+                    f"Add intermediate box on this frame ({self.frame_idx})  K")
+                key_here.setEnabled(
+                    self._keyframe_allowed(ann, self.frame_idx) is None
+                    and self.frame_idx not in (ann["start_frame"], ann["end_frame"]))
+            menu.addSeparator()
             start_jump = menu.addAction("Jump to start")
             end_jump = menu.addAction("Jump to end")
             end_jump.setEnabled(self.actions[index]["end_frame"] is not None)
@@ -1932,6 +2185,10 @@ class VideoAnnotator(QWidget):
             self._arm_endpoint(index, "start")
         elif action == end_here:
             self.end_action_here(index)
+        elif action == key_here:
+            self.arm_keyframe(index)
+        elif action == key_remove:
+            self.remove_keyframe(index, self.frame_idx)
         elif action == start_jump:
             self.jump_to_annotation(kind, index)
         elif action == end_jump:
@@ -2017,6 +2274,13 @@ class VideoAnnotator(QWidget):
     PARTICIPANT_COLUMNS = ["action_id", "video_name", "action", "individual", "class_name",
                            "join_frame", "join_time_sec", "leave_frame", "leave_time_sec"]
 
+    KEYFRAME_COLUMNS = ["action_id", "video_name", "action", "frame", "time_sec",
+                        "x", "y", "width", "height"]
+
+    def _keyframes_path(self, directory):
+        stem = os.path.splitext(self.video_name)[0]
+        return os.path.join(directory, f"{stem}_keyframes.csv")
+
     def _frame_columns(self, frame):
         """frame, time_sec — both empty for a frame not marked yet."""
         return ["", ""] if frame is None else [frame, f"{frame / self.fps:.3f}"]
@@ -2042,6 +2306,7 @@ class VideoAnnotator(QWidget):
             return
         points_path, bboxes_path, actions_path = self._csv_paths(directory)
         participants_path = self._participants_path(directory)
+        keyframes_path = self._keyframes_path(directory)
 
         legacy_note = ""
         try:
@@ -2080,6 +2345,14 @@ class VideoAnnotator(QWidget):
                                          participant["species"],
                                          *self._frame_columns(join), *self._frame_columns(leave)])
 
+            with open(keyframes_path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                writer.writerow(self.KEYFRAME_COLUMNS)
+                for action_id, ann in enumerate(ordered, 1):
+                    for frame, box in self._action_keyframes(ann):
+                        writer.writerow([action_id, self.video_name, ann["action"],
+                                         *self._frame_columns(frame), *box])
+
             # Overwriting a folder that held an old points file: its points
             # are now actions in the file above, so it must not be read again.
             if os.path.exists(points_path):
@@ -2104,7 +2377,8 @@ class VideoAnnotator(QWidget):
             self, "Saved",
             f"{len(self.bboxes)} apparitions → {os.path.basename(bboxes_path)}\n"
             f"{len(self.actions)} actions → {os.path.basename(actions_path)}\n"
-            f"their individuals → {os.path.basename(participants_path)}\n\n"
+            f"their individuals → {os.path.basename(participants_path)}\n"
+            f"their intermediate boxes → {os.path.basename(keyframes_path)}\n\n"
             f"Folder: {directory}{notes}{legacy_note}")
         self.hint_label.setText(f"Saved to {os.path.basename(directory)}/")
 
@@ -2168,6 +2442,7 @@ class VideoAnnotator(QWidget):
             return
         points_path, bboxes_path, actions_path = paths
         participants_path = self._participants_path(directory)
+        keyframes_path = self._keyframes_path(directory)
 
         bboxes, actions, skipped, converted = [], [], 0, 0
 
@@ -2196,6 +2471,11 @@ class VideoAnnotator(QWidget):
             individuals = {}
             for row in rows(participants_path):
                 individuals.setdefault(row["action_id"].strip(), []).append(row)
+            keyframes = {}
+            for row in rows(keyframes_path):
+                box = self._read_box(row, "")
+                if box is not None:
+                    keyframes.setdefault(row["action_id"].strip(), {})[int(row["frame"])] = box
             for row in rows(actions_path):
                 # Files from before end boxes existed have x,y,width,height
                 start_box = (self._read_box(row, "start_")
@@ -2206,6 +2486,7 @@ class VideoAnnotator(QWidget):
                     "start_box": start_box,
                     "end_frame": self._read_int(row, "end_frame"),
                     "end_box": self._read_box(row, "end_"),
+                    "keyframes": keyframes.get((row.get("action_id") or "").strip(), {}),
                 }
                 listed = individuals.get((row.get("action_id") or "").strip())
                 if listed:
@@ -2271,6 +2552,7 @@ class VideoAnnotator(QWidget):
             # Points saved by the previous version may carry an end frame
             "end_frame": self._read_int(row, "end_frame"),
             "end_box": None,
+            "keyframes": {},
         }
 
     def _read_participant(self, ann, row):

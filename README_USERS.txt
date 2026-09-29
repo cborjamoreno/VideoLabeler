@@ -79,6 +79,17 @@ HOW TO USE IT
    frame, right-click the interaction and choose "Individual joins..." or
    "Individual leaves...".
 
+   LONG ACTIONS OR ANIMALS THAT MOVE A LOT: between the start and the end
+   a dashed box slides in a straight line, which may not follow the animal.
+   Go to a frame in between where it drifts off, select the action in the
+   list and press K (or right-click it -> "Add intermediate box on this
+   frame"), then click two corners around the animal. Add as many as you
+   want; the dashed box then goes from each box to the next. Right-click ->
+   "Remove intermediate box" deletes one.
+   When an action is selected, the "Boxes" panel on the right lists its
+   start box, its intermediate boxes and its end box: click one to go to
+   its frame; "Add box here" and "Remove box" work on the current frame.
+
    To fix an action later: select it in the list, press Enter to go to it,
    then S on its real first frame (draw the start box again) or E on its
    real last frame.
@@ -102,6 +113,7 @@ Nothing is overwritten unless you ask for it (see below).
         GX024702_actions.csv    <- the actions (type, species, start, end)
         GX024702_participants.csv  <- each individual of each action, with
                                       when it joined and left
+        GX024702_keyframes.csv  <- the intermediate boxes of each action
 
 The CSVs open in Excel or LibreOffice. Columns:
 
@@ -138,6 +150,7 @@ USEFUL KEYS
   Ctrl+Z             undo
   Esc                switch the tool off
   S / E              redraw the start / end box of the selected action
+  K                  add an intermediate box to the selected action
 
 
 IMPORTANT
