@@ -89,6 +89,9 @@ HOW TO USE IT
    When an action is selected, the "Boxes" panel on the right lists its
    start box, its intermediate boxes and its end box: click one to go to
    its frame; "Add box here" and "Remove box" work on the current frame.
+   After clicking a box there, Delete removes that box (not the action).
+   Removing the END box reopens the action: it stays in progress until
+   you press E on its new last frame.
 
    To fix an action later: select it in the list, press Enter to go to it,
    then S on its real first frame (draw the start box again) or E on its

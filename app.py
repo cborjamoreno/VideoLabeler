@@ -477,7 +477,10 @@ class VideoAnnotator(QWidget):
         self.add_box_button.setToolTip("Draw a box of this action on the current frame")
         self.remove_box_button = self._make_button("Remove box", "delete-button",
                                                    self.remove_current_keyframe)
-        self.remove_box_button.setToolTip("Remove the intermediate box of the current frame")
+        self.remove_box_button.setToolTip("Remove the box of the current frame (Delete, once clicked).\n"
+                                          "Removing the END box reopens the action.")
+        # A box clicked in this panel: Delete removes it rather than the action
+        self._box_picked = False
         self.boxes_panel = QWidget(self)
         boxes_layout = QVBoxLayout(self.boxes_panel)
         boxes_layout.setContentsMargins(0, 0, 0, 0)
@@ -623,7 +626,7 @@ class VideoAnnotator(QWidget):
             ("M", self.toggle_mute),
             ("Ctrl+Z", self.undo_last),
             ("Ctrl+S", self.save_csvs),
-            ("Delete", self.delete_selected_annotation),
+            ("Delete", self._on_delete),
             ("Return", self._on_return),
             ("Enter", self._on_return),
             ("Shift+Return", lambda: self.jump_to_selected_annotation(to_end=True)),
@@ -1584,6 +1587,23 @@ class VideoAnnotator(QWidget):
             f"({len(self._action_keyframes(ann))} intermediate)")
         return True
 
+    def reopen_action(self, index):
+        """Remove the end of an action (its END box): it is in progress again
+        until E marks a new last frame."""
+        ann = self.actions[index]
+        if ann["end_frame"] is None:
+            return
+        self.history.append(("endpoint", "action", index, "end",
+                             ann["end_frame"], ann["end_box"]))
+        frame = ann["end_frame"]
+        ann["end_frame"] = None
+        ann["end_box"] = None
+        self.dirty = True
+        self.refresh_annotation_list(select=("action", index))
+        self.show_frame()
+        self.hint_label.setText(
+            f"{self._action_label(ann)} — end on frame {frame} removed, it is open again")
+
     def remove_keyframe(self, index, frame):
         ann = self.actions[index]
         if frame not in ann["keyframes"]:
@@ -1954,10 +1974,14 @@ class VideoAnnotator(QWidget):
                 self.boxes_list.scrollToItem(item)
                 current = data[0]
         self.boxes_list.blockSignals(False)
+        if current is None:
+            self._box_picked = False
         inside = self._keyframe_allowed(ann, self.frame_idx) is None
         self.add_box_button.setEnabled(self.cap is not None and inside)
         self.add_box_button.setText("Redraw box here  (K)" if current else "Add box here  (K)")
-        self.remove_box_button.setEnabled(current == "BOX")
+        self.remove_box_button.setEnabled(current in ("BOX", "END"))
+        self.remove_box_button.setText("Remove end (reopen)" if current == "END"
+                                       else "Remove box")
 
     def on_box_clicked(self, item):
         data = item.data(Qt.ItemDataRole.UserRole)
@@ -1965,10 +1989,24 @@ class VideoAnnotator(QWidget):
             return
         self.pause()
         self.seek_to(data[1])
+        self._box_picked = True
+
+    def _current_box_row(self):
+        """('BOX' | 'END' | 'START', frame) of the box on screen, or None."""
+        item = self.boxes_list.currentItem()
+        data = None if item is None else item.data(Qt.ItemDataRole.UserRole)
+        return data if data is not None and data[1] == self.frame_idx else None
 
     def remove_current_keyframe(self):
+        """Remove the box of the current frame: an intermediate one, or the
+        END one — which reopens the action. The START box cannot go."""
         index = self._boxes_action()
-        if index is not None:
+        if index is None:
+            return
+        row = self._current_box_row()
+        if row is not None and row[0] == "END":
+            self.reopen_action(index)
+        else:
             self.remove_keyframe(index, self.frame_idx)
 
     def _selected_open_action(self):
@@ -1997,6 +2035,7 @@ class VideoAnnotator(QWidget):
     def on_open_action_selected(self, *_):
         """Picking an action in progress also selects it in the list above, so
         E and the frame overlay follow it."""
+        self._box_picked = False
         self._style_end_open_button()
         index = self._selected_open_action()
         if index is None:
@@ -2014,6 +2053,7 @@ class VideoAnnotator(QWidget):
 
     def on_annotation_selected(self, *_):
         """Keep the "In progress" panel on the same action as the list."""
+        self._box_picked = False
         selected = self._selected_annotation()
         if selected is not None and selected[0] == "action":
             for row in range(self.open_list.count()):
@@ -2070,6 +2110,16 @@ class VideoAnnotator(QWidget):
         self.hint_label.setText(
             f"Deleted {self.KIND_LABELS[kind].lower()} '{self._name(kind, removed)}' "
             f"at frame {self._start_frame(kind, removed)}")
+
+    def _on_delete(self):
+        """Delete key: the box clicked in the boxes panel if there is one (not
+        the START box), else the annotation selected in the list."""
+        if self._box_picked and self.boxes_panel.isVisible():
+            row = self._current_box_row()
+            if row is not None and row[0] != "START":
+                self.remove_current_keyframe()
+                return
+        self.delete_selected_annotation()
 
     def delete_selected_annotation(self):
         selected = self._selected_annotation()

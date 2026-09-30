@@ -160,7 +160,7 @@ then overwrite that folder, the points file is renamed
 | `K` | Add (or redraw) an intermediate box of the selected action on the current frame |
 | `Esc` | Disarm the tool / cancel a half-drawn box (an action waiting for its end stays open) |
 | `Ctrl+Z` | Undo the last annotation or redrawn start / end |
-| `Del` | Delete the annotation selected in the list |
+| `Del` | Delete the box clicked in the boxes panel, else the annotation selected in the list |
 | Right-click an annotation | Edit its species / type, redraw start / end, jump, or delete it |
 | `Enter` or double-click a list row | Jump to that annotation (`Shift`+`Enter`: an action's end) |
 | `Ctrl` + mouse wheel | Zoom in/out on the frame (does not affect coordinates) |
