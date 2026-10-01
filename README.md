@@ -32,6 +32,46 @@ Then press **Open Video** and pick a file (`.mp4`, `.avi`, `.mov`, `.mkv`, …).
 To hand the tool to someone who has no Python — a single `.exe` on Windows or a
 double-clickable `.app` on macOS — see [PACKAGING.md](PACKAGING.md).
 
+## Ubuntu
+
+There is no prebuilt Linux executable in the repository: either run from
+source or build one yourself. Tested on Ubuntu 22.04 (Python 3.10).
+
+**From source.** Ubuntu's Python needs `venv` and, for Qt 6.5+, the
+`libxcb-cursor0` library — without it the app dies at startup with
+*"Could not load the Qt platform plugin xcb"*.
+
+```bash
+sudo apt install python3-venv python3-pip libxcb-cursor0
+cd VideoLabeler
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python app.py
+```
+
+Next time it is just:
+
+```bash
+cd VideoLabeler
+source .venv/bin/activate
+python app.py
+```
+
+**As an executable.** From the same activated environment:
+
+```bash
+pip install pyinstaller
+pyinstaller videolabeler.spec
+./dist/VideoLabeler
+```
+
+`dist/VideoLabeler` is a single file that runs without Python on other Linux
+machines with the same or a newer glibc (build on the oldest Ubuntu you need
+to support). Copy it somewhere writable — it saves its CSVs to an
+`annotations` folder next to itself. If it lost its execute bit on the way
+(e.g. through a zip or a download), run `chmod +x VideoLabeler`.
+
 ## Workflow
 
 1. **Open Video**.
