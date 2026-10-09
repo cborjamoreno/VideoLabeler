@@ -103,6 +103,9 @@ HOW TO USE IT
 
 8. When you are done — or every now and then — press "Save CSVs".
 
+9. To get a video with the annotations drawn on it, press "Export video".
+   It goes into the same folder as the CSVs, named <video>_annotated.mp4.
+
 
 WHERE THE RESULTS GO
 --------------------

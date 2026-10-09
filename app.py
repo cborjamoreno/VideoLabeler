@@ -42,6 +42,8 @@ Dependencies: PyQt6, opencv-python, numpy. Nothing else.
 import copy
 import csv
 import os
+import shutil
+import subprocess
 import sys
 from datetime import datetime
 
@@ -52,7 +54,7 @@ from PyQt6.QtWidgets import (
     QApplication, QWidget, QLabel, QPushButton, QFileDialog, QVBoxLayout,
     QHBoxLayout, QMessageBox, QSlider, QComboBox, QListWidget, QListWidgetItem, QLineEdit,
     QSizePolicy, QScrollArea, QFrame, QGridLayout, QMenu, QDialog, QStyle,
-    QStyleOptionSlider
+    QStyleOptionSlider, QProgressDialog
 )
 from PyQt6.QtGui import (QPixmap, QImage, QGuiApplication, QShortcut, QKeySequence,
                          QRegularExpressionValidator, QCursor)
@@ -373,6 +375,10 @@ class VideoAnnotator(QWidget):
         self.open_button.setEnabled(True)
         self.load_button = self._make_button("Load CSVs", "neutral-button", self.load_csvs, width=130)
         self.save_button = self._make_button("Save CSVs", "save-button", self.save_csvs, width=130)
+        self.export_button = self._make_button("Export video", "neutral-button",
+                                               self.export_video, width=130)
+        self.export_button.setToolTip("Write the video with the annotations drawn on it,\n"
+                                      "as in the display, next to the CSVs")
         self.video_info_label = QLabel("No video loaded")
 
         # Playback row
@@ -515,6 +521,7 @@ class VideoAnnotator(QWidget):
         top_layout.addWidget(self.open_button)
         top_layout.addWidget(self.load_button)
         top_layout.addWidget(self.save_button)
+        top_layout.addWidget(self.export_button)
         top_layout.addSpacing(15)
         top_layout.addWidget(self.video_info_label)
         top_layout.addStretch()
@@ -660,7 +667,7 @@ class VideoAnnotator(QWidget):
         for widget in (self.play_button, self.step_back_button, self.step_fwd_button,
                        self.skip_back_button, self.skip_fwd_button,
                        self.bbox_button, self.action_button,
-                       self.save_button,
+                       self.save_button, self.export_button,
                        self.load_button, self.delete_button):
             widget.setEnabled(enabled)
         self.speed_combo.setEnabled(enabled)
@@ -2315,6 +2322,100 @@ class VideoAnnotator(QWidget):
         os.makedirs(path)
         self.session_dir = path
         return path
+
+    # ------------------------------------------------------------------
+    # annotated video export
+    # ------------------------------------------------------------------
+    def export_video(self):
+        """Write <video>_annotated.mp4 into the session folder: every frame
+        with the overlay the display shows (boxes, captions, banner).
+
+        OpenCV writes the frames (mp4v, no sound). If ffmpeg is installed, the
+        result is re-encoded to H.264 — which every player opens — and the
+        original audio is copied in."""
+        if self.cap is None or self.video_path is None:
+            return
+        self.pause()
+        out_dir = self._ensure_session_dir()
+        stem = os.path.splitext(self.video_name)[0]
+        out_path = os.path.join(out_dir, f"{stem}_annotated.mp4")
+        ffmpeg = shutil.which("ffmpeg")
+        raw_path = os.path.join(out_dir, f".{stem}_frames.mp4") if ffmpeg else out_path
+
+        reader = cv2.VideoCapture(self.video_path)
+        height, width = self.current_frame.shape[:2]
+        writer = cv2.VideoWriter(raw_path, cv2.VideoWriter_fourcc(*"mp4v"),
+                                 self.fps, (width, height))
+        if not reader.isOpened() or not writer.isOpened():
+            reader.release()
+            writer.release()
+            QMessageBox.warning(self, "Export video", "Could not open the video for export.")
+            return
+
+        total = self.total_frames or 0
+        progress = QProgressDialog("Exporting annotated video…", "Cancel", 0,
+                                   total + (1 if ffmpeg else 0), self)
+        progress.setWindowTitle("Export video")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+
+        # build_overlay draws self.current_frame on self.frame_idx: borrow
+        # them, without the rubber band of a half-drawn box.
+        saved = (self.frame_idx, self.current_frame, self.bbox_first_corner)
+        self.bbox_first_corner = None
+        written = 0
+        cancelled = False
+        try:
+            while True:
+                ok, frame = reader.read()
+                if not ok or frame is None:
+                    break
+                self.frame_idx = written
+                self.current_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                writer.write(cv2.cvtColor(self.build_overlay(), cv2.COLOR_RGB2BGR))
+                written += 1
+                if written % 10 == 0:
+                    progress.setValue(min(written, total))
+                    QApplication.processEvents()
+                    if progress.wasCanceled():
+                        cancelled = True
+                        break
+        finally:
+            self.frame_idx, self.current_frame, self.bbox_first_corner = saved
+            reader.release()
+            writer.release()
+
+        if cancelled:
+            progress.close()
+            os.remove(raw_path)
+            self.hint_label.setText("Export cancelled")
+            return
+
+        note = ""
+        if ffmpeg:
+            progress.setLabelText("Encoding H.264 and adding the audio…")
+            progress.setValue(total)
+            QApplication.processEvents()
+            command = [ffmpeg, "-y", "-loglevel", "error", "-i", raw_path,
+                       "-i", self.video_path, "-map", "0:v:0", "-map", "1:a:0?",
+                       "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
+                       "-c:a", "copy", out_path]
+            result = subprocess.run(command, capture_output=True, text=True)
+            if result.returncode != 0:
+                # e.g. an audio codec mp4 cannot hold: retry re-encoding it
+                command[command.index("copy")] = "aac"
+                result = subprocess.run(command, capture_output=True, text=True)
+            if result.returncode == 0:
+                os.remove(raw_path)
+            else:
+                os.replace(raw_path, out_path)
+                note = "\n\nffmpeg failed, so it has no sound:\n" + result.stderr.strip()[-500:]
+        else:
+            note = "\n\nffmpeg is not installed, so it has no sound."
+        progress.close()
+        self.show_frame()
+        self.hint_label.setText(f"Exported {written} frames to {out_path}")
+        QMessageBox.information(self, "Export video", f"Saved to:\n{out_path}{note}")
 
     ACTION_COLUMNS = ["action_id", "video_name", "action", "classes", "individuals",
                       "start_frame", "start_time_sec", "end_frame", "end_time_sec", "duration_sec",

@@ -86,6 +86,11 @@ to support). Copy it somewhere writable — it saves its CSVs to an
    * **Action** — see below.
 5. **Save CSVs** when done (or `Ctrl+S`). No dialog: the app creates its own
    output folder and tells you where it wrote the files.
+6. **Export video** (optional) writes `<video>_annotated.mp4` into the same
+   folder: the whole video with the annotations drawn exactly as the display
+   shows them (boxes, captions, the in-progress banner). With `ffmpeg`
+   installed (`sudo apt install ffmpeg` on Ubuntu) it is H.264 and keeps the
+   original sound; without it, OpenCV writes an `mp4v` file with no sound.
 
 ### Actions
 
@@ -186,6 +191,7 @@ then overwrite that folder, the points file is renamed
 | **Open Video** | Choose the video file to annotate |
 | **Load CSVs** | Re-import CSVs (opens in the video's folder) to continue or correct them |
 | **Save CSVs** | Write the CSVs (`Ctrl+S`) |
+| **Export video** | Write the video with the annotations drawn on it |
 | **▶ Play / ⏸ Pause** | Start / stop playback (`Space`) |
 | **« 5s** / **5s »** | Jump 5 seconds back / forward (`←` / `→`) |
 | **−1f** / **+1f** | Step one frame back / forward (`Shift`+`←`/`→`, or `,` / `.`) |
